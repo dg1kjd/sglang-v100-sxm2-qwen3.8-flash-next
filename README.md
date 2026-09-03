@@ -49,14 +49,15 @@ and 0% GPU — the scheduler blocks on a poller rather than spinning.
 | | |
 |---|---|
 | GPUs | 4× V100 32 GB (SXM2 recommended; NVLink helps, a partial mesh is fine) |
-| Host RAM | 340 GB+ (the PLE table is host-resident; the hierarchical cache wants more) |
-| Disk | ~250 GB for weights, plus space for the disk cache tier |
+| Host RAM | **~134 GB measured in use** at 262K context with `--hicache-size 8`. 160 GB is a comfortable floor. The host cache tier scales with `--hicache-size`, so you can trade it down on a smaller box |
+| Disk | 126 GB for the NVFP4 weights, plus space for the disk cache tier |
 | CUDA | 12.8 or 12.9 — **not 13.x**, which removed Volta support |
 | Host compiler | GCC **≤ 14** with a working `cc1plus`. CUDA 12.9 rejects GCC 15, and many distros now default to it |
 | Python | 3.12 |
 
 The 32 GB-per-GPU figure is not negotiable: the NVFP4 weights alone are ~22 GB
-per rank at TP=4.
+per rank at TP=4. The host-RAM and disk figures are measured on a running
+system, not estimated.
 
 ## Quick start
 
@@ -146,7 +147,7 @@ Stated plainly, because the alternative is you finding them at 3am:
 - **The dense NVFP4 linear path is unverified.** It matters only if a checkpoint
   quantises weights outside the MoE experts; Qwen3.8-Flash-Next does not.
 
-Open items are tracked in [`.reland/TODO.md`](.reland/TODO.md).
+Open items are tracked in [`docs/v100/KNOWN-ISSUES.md`](docs/v100/KNOWN-ISSUES.md).
 
 ## Relationship to upstream
 
@@ -156,18 +157,45 @@ re-based onto upstream `main` as of 2026-09-02 (`99b910955`). Upstream's engine
 speculative decoding stack — is used as-is wherever possible; this fork adds the
 sm70 layer and the Qwen3.8-Flash-Next model support on top.
 
-Every deviation from upstream is documented with its reasoning in
-[`.reland/decisions.md`](.reland/decisions.md), and the procedure for taking a
-newer upstream is in [`.reland/NEXT-SYNC.md`](.reland/NEXT-SYNC.md).
+Every deviation from upstream carries its reasoning in the commit that made it;
+`git log` is the record. The procedure for taking a newer upstream — including
+the one trap that matters — is in
+[`docs/v100/UPSTREAM-SYNC.md`](docs/v100/UPSTREAM-SYNC.md).
 
 Bug reports about the sm70 path belong here. Bug reports about SGLang itself
 belong upstream.
 
-## License
+## Credits
 
-Apache 2.0, inherited from SGLang. See [LICENSE](LICENSE).
+This is a derivative work of [SGLang](https://github.com/sgl-project/sglang)
+(Apache 2.0, Copyright 2023-2024 SGLang Team). Upstream does the hard part; this
+fork adds a Volta layer on top.
 
-The Marlin V100 kernels are built from
-[zhinianqin/marlin_v100](https://github.com/zhinianqin/marlin_v100); the
-TurboMind sm70 backend derives from InternLM's TurboMind. Both retain their
-original licenses.
+The Volta build also stands on
+[marlin_v100](https://github.com/zhinianqin/marlin_v100),
+[1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) (TurboMind sm70),
+[CUTLASS](https://github.com/NVIDIA/cutlass),
+[FlashInfer](https://github.com/flashinfer-ai/flashinfer) and
+[TileLang](https://github.com/tile-ai/tilelang). None are redistributed here —
+the build fetches them at pinned revisions. Full attribution in
+[NOTICE](NOTICE).
+
+## License and disclaimer
+
+Apache 2.0, inherited from SGLang — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+This is an **independent community fork**. It is not affiliated with, endorsed
+by, or supported by the SGLang project, LMSYS, NVIDIA, or the model's authors.
+
+Provided **as is, without warranty or condition of any kind**, per Section 7 of
+the Apache License. It drives hardware its vendor no longer supports, using
+kernels written specifically for that purpose; validate it in your own
+environment before relying on it for anything that matters.
+
+No model weights are distributed here. Any checkpoint you use remains subject to
+its own license and terms, which you must satisfy independently.
+
+## Contact
+
+Issues and pull requests are the preferred channel. For anything that does not
+belong in public, `git@jens-david-consulting.com`.

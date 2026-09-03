@@ -1,0 +1,57 @@
+SGLang V100
+===========
+
+This project is a derivative work of SGLang, adding Volta (sm70) support.
+
+    SGLang
+    https://github.com/sgl-project/sglang
+    Copyright 2023-2024 SGLang Team
+    Licensed under the Apache License, Version 2.0
+
+This is an independent, community fork. It is not affiliated with, endorsed by,
+or supported by the SGLang project or LMSYS. Please do not file issues about
+this fork's sm70 code against upstream SGLang, and do not file issues about
+upstream SGLang here.
+
+Third-party components
+----------------------
+
+The Volta build links against or derives from the following projects. Each
+remains under its own license and copyright; consult each project for terms.
+None of them are redistributed in this repository — the build scripts fetch
+them at pinned revisions.
+
+  marlin_v100 — SM70 Marlin GPTQ/AWQ kernels
+    https://github.com/zhinianqin/marlin_v100
+
+  1Cat-vLLM — source of the SM70 TurboMind block-FP8 / FP16 MoE backend
+    https://github.com/1CatAI/1Cat-vLLM
+
+  NVIDIA CUTLASS
+    https://github.com/NVIDIA/cutlass
+    Copyright (c) NVIDIA Corporation
+
+  FlashInfer (patched for sm70; see patches/flashinfer-sm70.patch)
+    https://github.com/flashinfer-ai/flashinfer
+
+  TileLang — the sm70 attention and GDN kernels build on TileLang
+    https://github.com/tile-ai/tilelang
+
+Patches under patches/ are modifications to the above projects, distributed
+under this repository's Apache 2.0 license, and are only meaningful when applied
+to the upstream sources they name.
+
+Models
+------
+
+No model weights are distributed here. Qwen3.8-Flash-Next and any other
+checkpoint referenced in documentation or tests remain subject to their own
+licenses and terms of use, which you must satisfy independently.
+
+Disclaimer
+----------
+
+Provided "AS IS", without warranty or condition of any kind, express or implied,
+per Section 7 of the Apache License 2.0 in LICENSE. This software drives
+expensive hardware in ways its vendors no longer support; you are responsible
+for validating it in your own environment before relying on it.
