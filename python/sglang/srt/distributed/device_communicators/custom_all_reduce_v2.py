@@ -76,6 +76,31 @@ _FORCE_PULL_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB.get()
 _FORCE_PUSH_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get()
 
 
+def _resolve_forced_algo_family() -> Optional[str]:
+    """Restrict algorithm selection from SGLANG_CUSTOM_ALLREDUCE_ALGO.
+
+    The V100 mesh is only partially NVLink-connected (in-domain links plus a
+    single cross-pair link per rank), where the two-stage algorithm is
+    pathological, so the production launcher pins `1stage`. Until now only the
+    legacy sgl-kernel communicator read this variable, so that same launch
+    silently ignored it whenever CustomAllReduceV2 initialized instead.
+    """
+    value = envs.SGLANG_CUSTOM_ALLREDUCE_ALGO.get()
+    if not value:
+        return None
+    if value in ("1stage", "oneshot"):
+        return "one_shot"
+    if value in ("2stage", "twoshot"):
+        return "two_shot"
+    raise ValueError(
+        f"Invalid SGLANG_CUSTOM_ALLREDUCE_ALGO={value!r}. "
+        "Valid values: 1stage, oneshot, 2stage, twoshot."
+    )
+
+
+_FORCED_ALGO_FAMILY = _resolve_forced_algo_family()
+
+
 def _ceil_align(nbytes: int, align: int) -> int:
     return (nbytes + align - 1) // align * align
 
@@ -335,6 +360,12 @@ class CustomAllReduceV2:
     def _pick_config(self, nbytes: int, can_use_graph: bool) -> AllReduceConfig | None:
         # TODO: refactor this along with the config file
         heuristic = self.config.graph if can_use_graph else self.config.eager
+        if _FORCED_ALGO_FAMILY == "one_shot":
+            if nbytes <= heuristic.one_shot_push_threshold:
+                return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
+            return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
+        if _FORCED_ALGO_FAMILY == "two_shot":
+            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph)
         can_use_multicast = self.config.num_mc_blocks is not None
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)

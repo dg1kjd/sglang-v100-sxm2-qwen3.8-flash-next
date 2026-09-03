@@ -885,7 +885,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # NOTE: Determine the MLP type based on the model type
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if config.model_type == "qwen3_5_moe_text":
+        if config.model_type in ("qwen3_5_moe_text", "qwen4_exp_text"):
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -1137,7 +1137,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
-        elif config.model_type == "qwen3_5_moe_text":
+        elif config.model_type in ("qwen3_5_moe_text", "qwen4_exp_text"):
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -1476,6 +1476,8 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
+    decoder_layer_types = ALL_DECODER_LAYER_TYPES
+
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1570,7 +1572,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Decoder layers
         def get_layer(idx: int, prefix: str):
             layer_type = config.layers_block_type[idx]
-            layer_class = ALL_DECODER_LAYER_TYPES[layer_type]
+            layer_class = self.decoder_layer_types[layer_type]
             if layer_type == "attention":
                 prefix = add_prefix("self_attn", prefix)
             else:

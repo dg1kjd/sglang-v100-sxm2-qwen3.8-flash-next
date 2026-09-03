@@ -1022,6 +1022,27 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             num_tokens_per_dp=num_tokens_per_dp,
         )
 
+    def mamba_track_aligned_lens(self) -> Optional[torch.Tensor]:
+        """Tokens of THIS extend chunk covered by the tracked (extra-buffer) state.
+
+        The extra-buffer scheduler parks its snapshot at a
+        ``mamba_cache_chunk_size`` boundary, not at the current position, so
+        anything snapshotting alongside it needs the same boundary. None when
+        tracking metadata is absent (no mask, or a prefill CUDA-graph replay
+        that does not carry ``mamba_track_seqlens`` -- mamba skips tracking
+        there too). Masked-off rows hold garbage and are the caller's mask to
+        handle.
+        """
+        if (
+            self.mamba_track_mask is None
+            or self.mamba_track_seqlens is None
+            or self.extend_prefix_lens is None
+        ):
+            return None
+        chunk_size = get_global_server_args().mamba_cache_chunk_size
+        lens_to_track = self.mamba_track_seqlens - self.extend_prefix_lens
+        return (lens_to_track // chunk_size) * chunk_size
+
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
         Merge all multimodal inputs in the batch into a single MultiModalInputs object.

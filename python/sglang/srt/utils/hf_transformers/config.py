@@ -61,15 +61,31 @@ _LONGCAT_ARCHS = {
 }
 
 
-def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
+def _registry_key_before_autoconfig(config_dict: dict) -> Optional[str]:
+    """_CONFIG_REGISTRY key for checkpoints AutoConfig cannot load as-is.
+
+    Recent Transformers releases register their own strict LagunaConfig, and
+    some released Poolside checkpoints use a per-attention-type rope dictionary
+    that those releases reject before SGLang gets a chance to replace the
+    config from ``_CONFIG_REGISTRY``.
+    """
+    architectures = config_dict.get("architectures") or []
+    if any(arch in _LONGCAT_ARCHS for arch in architectures):
+        return "longcat_flash"
+    if config_dict.get("model_type") == "laguna":
+        return "laguna"
+    return None
+
+
+def _try_load_registry_config(model, revision: Optional[str], **kwargs):
     config_dict, _ = PretrainedConfig.get_config_dict(
         model, revision=revision, **kwargs
     )
-    architectures = config_dict.get("architectures") or []
-    if not any(arch in _LONGCAT_ARCHS for arch in architectures):
+    registry_key = _registry_key_before_autoconfig(config_dict)
+    if registry_key is None:
         return None
 
-    return _CONFIG_REGISTRY["longcat_flash"].from_pretrained(
+    return _CONFIG_REGISTRY[registry_key].from_pretrained(
         model, revision=revision, **kwargs
     )
 
@@ -83,7 +99,7 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = _try_load_longcat_config(model, revision, **kwargs)
+        config = _try_load_registry_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,

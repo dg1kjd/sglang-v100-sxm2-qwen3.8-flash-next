@@ -28,6 +28,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fp8_sm70 import fp8_sm70_to_fp32
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -39,6 +40,7 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+_is_sm70 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 7
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +202,18 @@ def _mla_launch_plan(
     return True, splits
 
 
+def _sm70_fp8_kv_view(k_buffer, v_buffer):
+    """sm70 PTX has no native fp8 operand type, so an fp8 KV cache is handed to
+    the kernel as raw uint8 and decoded inside the attention tile. Returns
+    ``(k_buffer, v_buffer, sm70_fp8_kv, sm70_fp8_e5m2)``, unchanged off sm70."""
+    if not _is_sm70 or k_buffer.dtype != v_buffer.dtype:
+        return k_buffer, v_buffer, False, False
+    if k_buffer.dtype not in (torch.float8_e5m2, torch.float8_e4m3fn):
+        return k_buffer, v_buffer, False, False
+    is_e5m2 = k_buffer.dtype == torch.float8_e5m2
+    return k_buffer.view(torch.uint8), v_buffer.view(torch.uint8), True, is_e5m2
+
+
 def _extract_kv_strides(buf, page_size: int):
     """Extract (slot_stride, head_stride, page_stride, tok_stride) for a 3-D
     ``[max_slots, head_num, head_dim]`` KV buffer.
@@ -259,6 +273,8 @@ def _fwd_kernel_stage1(
     Lv: tl.constexpr,
     xai_temperature_len: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    SM70_FP8_KV: tl.constexpr = False,
+    SM70_FP8_E5M2: tl.constexpr = False,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
     aux0_stride_t=0,
@@ -332,6 +348,10 @@ def _fwd_kernel_stage1(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
                 other=0.0,
             )
+            # sm70 has no native fp8 operand type; the buffer arrives as raw
+            # uint8 and is decoded to fp16 inside the tile.
+            if SM70_FP8_KV:
+                k = fp8_sm70_to_fp32(k, SM70_FP8_E5M2).to(tl.float16)
             qk = tl.sum(q[None, :] * k, 1)
             qk *= sm_scale_withk
 
@@ -375,6 +395,8 @@ def _fwd_kernel_stage1(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
                 other=0.0,
             )
+            if SM70_FP8_KV:
+                v = fp8_sm70_to_fp32(v, SM70_FP8_E5M2).to(tl.float16)
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -426,6 +448,8 @@ def _decode_att_m_fwd(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    sm70_fp8_kv=False,
+    sm70_fp8_e5m2=False,
 ):
     BLOCK = 64
     # [TODO] work around SGPR limit on MI3xx
@@ -498,6 +522,8 @@ def _decode_att_m_fwd(
         Lk=Lk,
         Lv=Lv,
         PAGE_SIZE=page_size,
+        SM70_FP8_KV=sm70_fp8_kv,
+        SM70_FP8_E5M2=sm70_fp8_e5m2,
         SCORE_MOD=score_mod,
         Aux0=aux0,
         aux0_stride_t=aux0_stride_t,
@@ -546,6 +572,8 @@ def _fwd_grouped_kernel_stage1(
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
     IS_GFX1250: tl.constexpr = False,
+    SM70_FP8_KV: tl.constexpr = False,
+    SM70_FP8_E5M2: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -629,6 +657,9 @@ def _fwd_grouped_kernel_stage1(
         # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
         if IS_GFX1250:
             q_k = q
+        elif SM70_FP8_KV:
+            # K_Buffer is a raw uint8 view on sm70; match the decoded fp16 K.
+            q_k = q.to(tl.float16)
         else:
             q_k = q.to(K_Buffer.dtype.element_ty)
         if BLOCK_DPE > 0:
@@ -658,6 +689,8 @@ def _fwd_grouped_kernel_stage1(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                 other=0.0,
             )
+            if SM70_FP8_KV:
+                k = fp8_sm70_to_fp32(k, SM70_FP8_E5M2).to(tl.float16)
             if IS_GFX1250:
                 qk = tl.dot(q_k, k.to(q_k.dtype))
             else:
@@ -676,6 +709,8 @@ def _fwd_grouped_kernel_stage1(
                     mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
                     other=0.0,
                 )
+                if SM70_FP8_KV:
+                    kpe = fp8_sm70_to_fp32(kpe, SM70_FP8_E5M2).to(tl.float16)
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale_withk
 
@@ -718,6 +753,8 @@ def _fwd_grouped_kernel_stage1(
                     mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
                     other=0.0,
                 )
+                if SM70_FP8_KV:
+                    v = fp8_sm70_to_fp32(v, SM70_FP8_E5M2).to(tl.float16)
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
@@ -785,8 +822,12 @@ def _decode_grouped_att_m_fwd(
     aux_tensors=None,
     tune_mla: bool = False,
     forced_kv_splits: int = 0,
+    sm70_fp8_kv=False,
+    sm70_fp8_e5m2=False,
 ):
-    BLOCK = 32
+    # Volta wants a 16-wide KV tile here: 32 overflows the 96KB smem budget
+    # once the fp8 decode expands each tile to fp16.
+    BLOCK = 16 if sm70_fp8_kv else 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
@@ -888,6 +929,8 @@ def _decode_grouped_att_m_fwd(
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
         IS_GFX1250=_is_gfx1250,
+        SM70_FP8_KV=sm70_fp8_kv,
+        SM70_FP8_E5M2=sm70_fp8_e5m2,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,
@@ -1061,6 +1104,8 @@ def decode_attention_fwd_normal(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    sm70_fp8_kv=False,
+    sm70_fp8_e5m2=False,
 ):
     _decode_att_m_fwd(
         q,
@@ -1078,6 +1123,8 @@ def decode_attention_fwd_normal(
         page_size=page_size,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
+        sm70_fp8_kv=sm70_fp8_kv,
+        sm70_fp8_e5m2=sm70_fp8_e5m2,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -1114,6 +1161,8 @@ def decode_attention_fwd_grouped(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    sm70_fp8_kv=False,
+    sm70_fp8_e5m2=False,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1136,6 +1185,8 @@ def decode_attention_fwd_grouped(
         aux_tensors=aux_tensors,
         tune_mla=tune_mla,
         forced_kv_splits=forced_kv_splits,
+        sm70_fp8_kv=sm70_fp8_kv,
+        sm70_fp8_e5m2=sm70_fp8_e5m2,
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
@@ -1229,6 +1280,10 @@ def decode_attention_fwd(
         )
         return
 
+    k_buffer, v_buffer, sm70_fp8_kv, sm70_fp8_e5m2 = _sm70_fp8_kv_view(
+        k_buffer, v_buffer
+    )
+
     if kv_group_num == 1:
         # MHA
         decode_attention_fwd_normal(
@@ -1250,6 +1305,8 @@ def decode_attention_fwd(
             page_size=page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            sm70_fp8_kv=sm70_fp8_kv,
+            sm70_fp8_e5m2=sm70_fp8_e5m2,
         )
     else:
         # GQA/MQA/MLA
@@ -1274,6 +1331,8 @@ def decode_attention_fwd(
             page_size=page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            sm70_fp8_kv=sm70_fp8_kv,
+            sm70_fp8_e5m2=sm70_fp8_e5m2,
         )
 
 

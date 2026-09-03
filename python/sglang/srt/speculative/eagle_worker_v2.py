@@ -1,4 +1,5 @@
 import contextlib
+import importlib
 import logging
 import time
 from dataclasses import replace
@@ -20,12 +21,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGra
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
-from sglang.srt.layers.attention.trtllm_mla_backend import (
-    TRTLLMMLABackend,
-)
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -128,6 +124,33 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+
+
+def _optional_mla_graph_backend_types() -> list:
+    """MLA draft-extend backends that support CUDA-graph capture, imported here
+    rather than at module scope.
+
+    `trtllm_mla_backend` reaches `flashinfer_mla_backend`, which imports the
+    flashinfer MLA wrappers at module scope; the SM70 (Volta) flashinfer build
+    ships no such API, so the import raises there. A non-MLA EAGLE worker never
+    builds these backends, and a missing one only narrows the isinstance test.
+    """
+    backend_types = []
+    for module_path, class_name in (
+        ("sglang.srt.layers.attention.trtllm_mla_backend", "TRTLLMMLABackend"),
+        ("sglang.srt.layers.attention.tokenspeed_mla_backend", "TokenspeedMLABackend"),
+    ):
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError as e:
+            logger.debug(
+                "Draft-extend CUDA graph: %s is unavailable in this build (%s).",
+                class_name,
+                e,
+            )
+            continue
+        backend_types.append(getattr(module, class_name))
+    return backend_types
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -432,12 +455,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         graph_supported_backend_types = [
             TritonAttnBackend,
-            TRTLLMMLABackend,
-            TRTLLMHAAttnBackend,
-            TokenspeedMLABackend,
+            # TRTLLMHAAttnBackend subclasses FlashInferAttnBackend, so it needs
+            # no entry of its own -- and no module-scope import (see
+            # _optional_mla_graph_backend_types).
             FlashInferAttnBackend,
         ]
         if _is_cuda or _is_musa:
+            graph_supported_backend_types.extend(_optional_mla_graph_backend_types())
             # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
             # deep_gemm and the rest of the sparse-attention stack at import time.
             from sglang.srt.layers.attention.dsa_backend import (

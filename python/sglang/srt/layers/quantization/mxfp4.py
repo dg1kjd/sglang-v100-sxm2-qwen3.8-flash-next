@@ -119,15 +119,30 @@ def _prepare_flashinfer_mxfp8_activations(
 
 
 if is_flashinfer_available():
-    from flashinfer import (
-        nvfp4_block_scale_interleave,
-        trtllm_fp4_block_scale_moe,
-    )
-    from flashinfer.fused_moe import (
-        trtllm_fp4_block_scale_routed_moe,
-    )
-    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
-    from flashinfer.tllm_enums import ActivationType, RoutingMethodType
+    # FlashInfer is optional and its Python package can be newer than the
+    # installed cubin package.  In that case the core package is importable,
+    # but newer MXFP4 helpers may not be exported.  Keep unrelated model
+    # formats (including FP16 on SM70) importable.
+    try:
+        from flashinfer import (
+            nvfp4_block_scale_interleave,
+            trtllm_fp4_block_scale_moe,
+        )
+        from flashinfer.fused_moe import (
+            trtllm_fp4_block_scale_routed_moe,
+        )
+        from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
+        from flashinfer.tllm_enums import ActivationType, RoutingMethodType
+
+        _FI_HAS_MXFP4 = True
+    except ImportError:
+        nvfp4_block_scale_interleave = None
+        trtllm_fp4_block_scale_moe = None
+        trtllm_fp4_block_scale_routed_moe = None
+        get_w2_permute_indices_with_cache = None
+        ActivationType = None
+        RoutingMethodType = None
+        _FI_HAS_MXFP4 = False
 
     # SM90 mixed-input helpers landed in FlashInfer #3084 (post-0.6.10). Older
     # versions don't ship them; gate at import so unrelated code paths still load.
@@ -143,6 +158,7 @@ if is_flashinfer_available():
         interleave_moe_weights_for_sm90_mixed_gemm = None
         _FI_HAS_SM90_CUTLASS_MXFP4 = False
 else:
+    _FI_HAS_MXFP4 = False
     _FI_HAS_SM90_CUTLASS_MXFP4 = False
 
 _flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 class LinearAttnKernelBackend(Enum):
     TRITON = "triton"
+    TILELANG = "tilelang"
     CUTEDSL = "cutedsl"
     NV_CUTEDSL = "nv_cutedsl"
     FLASHINFER = "flashinfer"
@@ -30,6 +31,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_triton(self):
         return self == LinearAttnKernelBackend.TRITON
+
+    def is_tilelang(self):
+        return self == LinearAttnKernelBackend.TILELANG
 
     def is_cutedsl(self):
         return self == LinearAttnKernelBackend.CUTEDSL

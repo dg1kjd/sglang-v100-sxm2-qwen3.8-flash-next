@@ -452,11 +452,23 @@ class FusedMoE(torch.nn.Module):
             if self.quant_method is None and quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
-                self.quant_method = UnquantizedFusedMoEMethod(
-                    self.use_triton_kernels,
-                    self.use_flashinfer_trtllm_moe,
-                    self.use_deep_gemm,
+                from sglang.srt.layers.quantization.sm70_fp16_moe import (
+                    SM70FP16MoEMethod,
+                    can_use_sm70_fp16_moe,
                 )
+
+                if (
+                    not with_bias
+                    and get_moe_a2a_backend().is_none()
+                    and can_use_sm70_fp16_moe(params_dtype)
+                ):
+                    self.quant_method = SM70FP16MoEMethod()
+                else:
+                    self.quant_method = UnquantizedFusedMoEMethod(
+                        self.use_triton_kernels,
+                        self.use_flashinfer_trtllm_moe,
+                        self.use_deep_gemm,
+                    )
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
         nvfp4_deferred = envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get() and isinstance(
@@ -830,12 +842,19 @@ class FusedMoE(torch.nn.Module):
             if not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                # Derive shard size from the loaded weight so padded buffers
-                # do not cause out-of-bounds indexing into the checkpoint.
-                loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
-                )
+                # Some params are allocated "full" on every rank (w2
+                # scales/qzeros for desc_act=False GPTQ-marlin carry all
+                # num_groups because is_k_full=True), so the checkpoint slice
+                # is already the per-rank shard and narrowing would overflow.
+                if loaded_weight.shape[shard_dim] > shard_size:
+                    # Derive shard size from the loaded weight so padded buffers
+                    # do not cause out-of-bounds indexing into the checkpoint.
+                    loaded_shard_size = (
+                        loaded_weight.shape[shard_dim] // self.moe_tp_size
+                    )
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim, loaded_shard_size * tp_rank, loaded_shard_size
+                    )
 
         # w2, down_proj: Load into only logical weight of w2.
         loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)

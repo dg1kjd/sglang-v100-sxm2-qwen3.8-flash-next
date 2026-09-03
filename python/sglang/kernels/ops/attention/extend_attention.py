@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
+from sglang.kernels.ops.attention.fp8_sm70 import fp8_sm70_to_fp32
 from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
@@ -36,6 +37,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
+_is_sm70 = _is_cuda and CUDA_CAPABILITY[0] == 7
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
@@ -48,6 +50,18 @@ try:
 except (AttributeError, ValueError):
     _triton_version_parts = (0, 0)
 _is_triton_ge_37 = _triton_version_parts >= (3, 7)
+
+
+def _sm70_fp8_kv_view(k_buffer, v_buffer):
+    """sm70 PTX has no native fp8 operand type, so an fp8 KV cache is handed to
+    the kernel as raw uint8 and decoded inside the attention tile. Returns
+    ``(k_buffer, v_buffer, sm70_fp8_kv, sm70_fp8_e5m2)``, unchanged off sm70."""
+    if not _is_sm70 or k_buffer.dtype != v_buffer.dtype:
+        return k_buffer, v_buffer, False, False
+    if k_buffer.dtype not in (torch.float8_e5m2, torch.float8_e4m3fn):
+        return k_buffer, v_buffer, False, False
+    is_e5m2 = k_buffer.dtype == torch.float8_e5m2
+    return k_buffer.view(torch.uint8), v_buffer.view(torch.uint8), True, is_e5m2
 
 
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
@@ -364,6 +378,8 @@ def _fwd_kernel(
     SKIP_EXTEND: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    SM70_FP8_KV: tl.constexpr = False,
+    SM70_FP8_E5M2: tl.constexpr = False,
     IS_GFX1250: tl.constexpr = False,
     USE_COMPACT_TILE_GRID: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
@@ -526,6 +542,10 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
+            # sm70 has no native fp8 operand type; the buffer arrives as raw
+            # uint8 and is decoded to fp16 inside the tile.
+            if SM70_FP8_KV:
+                k = fp8_sm70_to_fp32(k, SM70_FP8_E5M2).to(tl.float16)
             # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
             # dim K>=128 (K=64 ok). This prefix read fires when a radix-cache prefix is
             # reused (prefill reads the cached fp8 KV), and the MLA nope dot has K=512,
@@ -556,6 +576,8 @@ def _fwd_kernel(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
+                if SM70_FP8_KV:
+                    kpe = fp8_sm70_to_fp32(kpe, SM70_FP8_E5M2).to(tl.float16)
                 if IS_GFX1250:
                     qk += tl.dot(qpe, kpe.to(qpe.dtype))
                 else:
@@ -612,6 +634,8 @@ def _fwd_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
+            if SM70_FP8_KV:
+                v = fp8_sm70_to_fp32(v, SM70_FP8_E5M2).to(tl.float16)
             # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
             # on gfx1250; on other platforms restore the original p.to(v.dtype) cast.
             # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
@@ -856,6 +880,9 @@ def extend_attention_fwd(
     STORE_LSE = lse_extend is not None
     stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
+    k_buffer, v_buffer, sm70_fp8_kv, sm70_fp8_e5m2 = _sm70_fp8_kv_view(
+        k_buffer, v_buffer
+    )
 
     # Compact grid: AMD/HIP-only optimization (parity with flash-attn's ragged-aware
     # launch). Explicitly check _is_hip and allow env var override.
@@ -950,6 +977,8 @@ def extend_attention_fwd(
         SKIP_EXTEND=skip_extend,
         HAS_SINK=HAS_SINK,
         IS_GFX1250=_is_gfx1250,
+        SM70_FP8_KV=sm70_fp8_kv,
+        SM70_FP8_E5M2=sm70_fp8_e5m2,
         STORE_TRANSPOSE=_is_hip,
         USE_COMPACT_TILE_GRID=use_compact_tile_grid,
         PAGE_SIZE=page_size,
@@ -1044,6 +1073,8 @@ def _fwd_kernel_unified(
     IS_CAUSAL: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    SM70_FP8_KV: tl.constexpr = False,
+    SM70_FP8_E5M2: tl.constexpr = False,
     IS_GFX1250: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
@@ -1212,6 +1243,8 @@ def _fwd_kernel_unified(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
+            if SM70_FP8_KV:
+                k = fp8_sm70_to_fp32(k, SM70_FP8_E5M2).to(tl.float16)
 
             # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
             # dim K>=128 (K=64 ok). This prefix read fires when a radix-cache prefix is
@@ -1243,6 +1276,8 @@ def _fwd_kernel_unified(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
+                if SM70_FP8_KV:
+                    kpe = fp8_sm70_to_fp32(kpe, SM70_FP8_E5M2).to(tl.float16)
                 if IS_GFX1250:
                     qk += tl.dot(qpe, kpe.to(qpe.dtype))
                 else:
@@ -1300,6 +1335,8 @@ def _fwd_kernel_unified(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
+            if SM70_FP8_KV:
+                v = fp8_sm70_to_fp32(v, SM70_FP8_E5M2).to(tl.float16)
             # keep softmax weights p in fp32 for the P·V dot (do not downcast to bf16)
             # on gfx1250; on other platforms restore the original p.to(v.dtype) cast.
             # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
@@ -1393,6 +1430,9 @@ def extend_attention_fwd_unified(
 
     USE_CUSTOM_MASK = custom_mask is not None
     HAS_SINK = sinks is not None
+    k_buffer, v_buffer, sm70_fp8_kv, sm70_fp8_e5m2 = _sm70_fp8_kv_view(
+        k_buffer, v_buffer
+    )
 
     # For sliding window attention, window_start_pos tracks the absolute position
     # of the first key in each sequence's window
@@ -1460,6 +1500,8 @@ def extend_attention_fwd_unified(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
         IS_GFX1250=_is_gfx1250,
+        SM70_FP8_KV=sm70_fp8_kv,
+        SM70_FP8_E5M2=sm70_fp8_e5m2,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,

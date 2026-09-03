@@ -1,0 +1,79 @@
+services:
+  sglang-v100:
+    build:
+      context: ..
+      dockerfile: docker/v100.Dockerfile
+      network: host
+      args:
+        MAX_JOBS: ${MAX_JOBS:-}
+    image: sglang-v100:latest
+    container_name: sglang-v100
+    network_mode: host
+    ipc: host
+    restart: "no"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      NCCL_P2P_LEVEL: NVL
+      SGLANG_CUSTOM_ALLREDUCE_ALGO: 1stage
+      SGLANG_MAMBA_CONV_DTYPE: float16
+      SGLANG_MAMBA_SSM_DTYPE: float16
+      SGLANG_ENABLE_SPEC_V2: "1"
+      SGLANG_ENABLE_OVERLAP_PLAN_STREAM: "1"
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - sglang-v100-jit:/root/sglang-v100-jit
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command:
+      - --model
+      - Qwen/Qwen3.5-122B-A10B-GPTQ-Int4
+      - --dtype
+      - float16
+      - --quantization
+      - gptq_marlin
+      - --attention-backend
+      - tilelang_fa_v100
+      - --tensor-parallel-size
+      - "4"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8082"
+      - --mem-fraction-static
+      - "0.76"
+      - --context-length
+      - "262144"
+      - --max-running-requests
+      - "4"
+      - --chunked-prefill-size
+      - "4096"
+      - --mamba-scheduler-strategy
+      - extra_buffer
+      - --cuda-graph-max-bs
+      - "4"
+      - --cuda-graph-bs
+      - "1"
+      - "2"
+      - "4"
+      - --enable-nccl-nvls
+      - --speculative-algorithm
+      - DFLASH
+      - --speculative-draft-model-path
+      - z-lab/Qwen3.5-122B-A10B-DFlash
+      - --speculative-dflash-block-size
+      - "16"
+      - --reasoning-parser
+      - qwen3
+      - --tool-call-parser
+      - qwen3_coder
+
+volumes:
+  sglang-v100-jit:

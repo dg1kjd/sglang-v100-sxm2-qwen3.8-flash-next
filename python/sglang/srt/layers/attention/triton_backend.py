@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -60,6 +61,8 @@ from sglang.srt.utils import (
     is_xpu,
     next_power_of_2,
 )
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_gfx942 = is_gfx942_supported()
@@ -232,6 +235,10 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
+        # get_max_num_attention_heads() is the per-layer maximum: the decode
+        # scratch buffers are shared by every layer, and hybrid models with more
+        # query heads in SWA than in full-attention layers would otherwise make
+        # the stage-1 kernel write past attn_logits / attn_lse.
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
@@ -308,6 +315,7 @@ class TritonAttnBackend(AttentionBackend):
         self.enable_deterministic = (
             get_exec().deterministic.enable_deterministic_inference
         )
+        self._tune_sm70_decode_kv_splits()
 
         if self.enable_deterministic:
             # Fixed split tile size for batch invariance
@@ -374,6 +382,34 @@ class TritonAttnBackend(AttentionBackend):
             Lq=head_dim, Lv=head_dim
         )
         self.extend_attention_block_m = block_m
+
+    def _tune_sm70_decode_kv_splits(self):
+        if not _is_cuda or self.use_mla or self.enable_deterministic:
+            return
+        if torch.cuda.get_device_capability()[0] != 7:
+            return
+        sm_count = self.device_core_count
+        kv_heads = self.num_kv_head
+        if sm_count <= 0 or kv_heads <= 0:
+            return
+        # V100 has 80 SMs; the default split cap leaves them idle when KV-head
+        # parallelism is low (kv_heads=1 gives 16 blocks). 128 is the measured
+        # ceiling that saturates memory bandwidth without over-splitting.
+        target_splits = max(
+            next_power_of_2((sm_count + kv_heads - 1) // kv_heads),
+            self.max_kv_splits,
+        )
+        target_splits = min(target_splits, 128)
+        if target_splits != self.max_kv_splits:
+            logger.info(
+                "sm70 Triton decode: raising max_kv_splits %d -> %d "
+                "(sm_count=%d, kv_heads=%d)",
+                self.max_kv_splits,
+                target_splits,
+                sm_count,
+                kv_heads,
+            )
+            self.max_kv_splits = target_splits
 
     def get_num_kv_splits(
         self,
@@ -464,6 +500,11 @@ class TritonAttnBackend(AttentionBackend):
         index_table,
         kv_indices: torch.Tensor,
     ) -> torch.Tensor:
+        # Hybrid-SWA warmup metadata may retain padded entries beyond the
+        # logical batch size. Never let those entries resize the cumsum write
+        # or leak into the request-table gather.
+        seq_lens = seq_lens.reshape(-1)[:bs]
+        req_pool_indices = req_pool_indices.reshape(-1)[:bs]
         kv_indptr = self.kv_indptr[: bs + 1]
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
         create_flashinfer_kv_indices_triton[(bs,)](
@@ -967,7 +1008,10 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             qo_indptr = self.qo_indptr
-            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            qo_indptr[1 : bs + 1] = torch.cumsum(
+                forward_batch.extend_seq_lens.reshape(-1)[:bs],
+                dim=0,
+            )
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
             mask_indptr = None

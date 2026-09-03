@@ -234,6 +234,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         embedding_dim: int,
         *,
         params_dtype: Optional[torch.dtype] = None,
+        output_dtype: Optional[torch.dtype] = None,
         org_num_embeddings: Optional[int] = None,
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
@@ -244,6 +245,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     ):
         super().__init__()
         self.quant_config = quant_config
+        self.output_dtype = output_dtype
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
@@ -576,6 +578,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             else:
                 # Reduce across all the model parallel GPUs.
                 output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+        if self.output_dtype is not None:
+            output_parallel = output_parallel.to(self.output_dtype)
         return output_parallel
 
     def extra_repr(self) -> str:

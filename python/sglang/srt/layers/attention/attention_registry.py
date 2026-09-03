@@ -143,6 +143,15 @@ def create_dsa_backend(runner):
     return DeepseekSparseAttnBackend(runner)
 
 
+@register_attention_backend("qsa")
+def create_qsa_backend(runner):
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QwenSparseAttnBackend,
+    )
+
+    return QwenSparseAttnBackend(runner)
+
+
 @register_attention_backend("nsa")
 def _create_nsa_compat(runner):
     warnings.warn(
@@ -186,9 +195,30 @@ def create_triton_backend(runner):
         "Cross attention is not supported in the triton attention backend. "
         "Please use `--attention-backend flashinfer`."
     )
+
     from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
     return TritonAttnBackend(runner)
+
+
+@register_attention_backend("tilelang_fa_v100")
+def create_tilelang_fa_v100_backend(runner):
+    """Primary name for SGLang's self-contained SM70 TileLang backend."""
+    assert not runner.model_config.is_encoder_decoder, (
+        "Cross attention is not supported in the tilelang_fa_v100 backend."
+    )
+
+    from sglang.srt.layers.attention.flash_attn_v100_backend import (
+        FlashAttnV100Backend,
+    )
+
+    return FlashAttnV100Backend(runner)
+
+
+@register_attention_backend("flash_attn_v100")
+def create_flash_attn_v100_backend(runner):
+    """Compatibility alias for launch commands created before the rename."""
+    return create_tilelang_fa_v100_backend(runner)
 
 
 @register_attention_backend("torch_native")
@@ -452,6 +482,18 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 ), "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
             linear_attn_backend = GDNAttnBackend(runner)
+            # Qwen4-Exp is a hybrid of GDN linear-attention layers and sparse
+            # full-attention (QSA) layers, so its full-attn backend is replaced
+            # rather than left at the generic one picked above.
+            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+            if is_qwen_qsa(runner.model_config.hf_config):
+                from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+                    QwenSparseAttnBackend,
+                )
+
+                logger.info("Using QSA for sparse full-attention layers.")
+                full_attn_backend = QwenSparseAttnBackend(runner)
         elif mamba2_config(runner.model_config) is not None:
             from sglang.srt.configs.lfm2 import Lfm2Config
             from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig

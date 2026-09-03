@@ -298,6 +298,15 @@ class Envs:
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
+    # instead of gathering DP tokens for a global-TP lookup.
+    SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
+    # and phases fall back to the original implementation.
+    SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
+    # path is ported, so setting this fails loudly instead of degrading.
+    SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
@@ -957,6 +966,8 @@ class Envs:
     # ===================================================================
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
+    # Skip flashinfer norm kernels (CUTLASS-DSL uses cp.async which is sm80+ only)
+    SGLANG_DISABLE_FLASHINFER_NORM = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
@@ -1070,6 +1081,11 @@ class Envs:
     # colliding pad top-ks also inflate the DeepGEMM masked-GEMM workspace to
     # OOM at saturation.  Capture-safe (reads only global_num_tokens_gpu).
     SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
+    # Route decode-size HC mix through the fused CuTe split-K GEMM pair
+    # instead of the persistent Triton mix.
+    SGLANG_HC_MIX_CUDA = EnvBool(True)
+    # Split the HC combine gate dot across CTAs instead of one CTA per row.
+    SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
@@ -1199,6 +1215,18 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # Restrict all-reduce to a single algorithm family: "1stage"/"oneshot" or
+    # "2stage"/"twoshot" (unset = size heuristic). Needed on partially
+    # NVLink-connected meshes such as V100 SXM2, where two-stage is pathological.
+    SGLANG_CUSTOM_ALLREDUCE_ALGO = EnvStr(None)
+
+    # ===================================================================
+    # SM70 / V100 (Volta) adaptations
+    # ===================================================================
+    # Volta has no bfloat16, so weights and compute are forced to fp16. Set to
+    # 0 to keep the requested dtype for models whose linear-attention/GDN path
+    # was tuned in bf16 (upcast on read).
+    SGLANG_SM70_FORCE_FP16 = EnvBool(True)
 
     # ===================================================================
     # RoPE cache

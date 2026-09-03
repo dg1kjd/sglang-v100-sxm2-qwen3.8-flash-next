@@ -698,6 +698,10 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        # Qwen4-exp carries its MTP layer in the target checkpoint; the draft
+        # weights are selected by the Qwen4ExpForCausalLMMTP rewrite in
+        # ModelConfig, so the draft path defaults to the target path.
+        "Qwen4ExpForConditionalGeneration",
     ]:
         if cfg.speculative_draft_model_path is None:
             declare_resolution(
@@ -714,6 +718,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             if model_arch not in [
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
+                "Qwen4ExpForConditionalGeneration",
             ]:
                 logger.warning(
                     "DeepSeek MTP does not require setting speculative_draft_model_path."

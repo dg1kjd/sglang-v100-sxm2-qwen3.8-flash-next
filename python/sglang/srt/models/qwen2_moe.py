@@ -258,6 +258,11 @@ class Qwen2MoeMLP(nn.Module):
         self,
         x,
     ):
+        # sm70 turbomind fuses gate_up GEMM + SiLU + mul; returns None elsewhere.
+        fused_x = self.gate_up_proj.forward_fused_silu_and_mul(x)
+        if fused_x is not None:
+            x, _ = self.down_proj(fused_x)
+            return x
         gate_up, _ = self.gate_up_proj(x)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))

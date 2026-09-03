@@ -30,6 +30,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.quantization.utils import get_dynamic_override
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -81,6 +82,11 @@ def _mtp_quant_config(quant_config):
     return quant_config
 
 
+def _is_mtp_dynamically_unquantized(quant_config, prefix: str) -> bool:
+    dynamic = getattr(quant_config, "dynamic", None)
+    return bool(dynamic) and get_dynamic_override(quant_config, prefix) is False
+
+
 class Qwen3_5ForCausalLMMTP(nn.Module):
 
     @staticmethod
@@ -104,8 +110,19 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
+        mtp_prefix = add_prefix("mtp", prefix)
 
         quant_config = _mtp_quant_config(quant_config)
+
+        # GPTQModel dynamic exclusions are normally applied per linear layer.
+        # FusedMoE selects its quant method as a whole, so honor an `mtp.*`
+        # exclusion here before the expert parameters are allocated. The
+        # factory Qwen3.5-122B-A10B GPTQ-Int4 checkpoint stores its MTP module
+        # as unquantized weights.
+        if quant_config and _is_mtp_dynamically_unquantized(
+            quant_config, mtp_prefix
+        ):
+            quant_config = None
 
         self.config = config
         self.tp_size = get_parallel().tp_size
@@ -124,7 +141,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.model = Qwen3_5ForCausalLM(
             mtp_config,
             quant_config,
-            prefix=add_prefix("mtp", prefix),
+            prefix=mtp_prefix,
             is_nextn=True,
         )
 
