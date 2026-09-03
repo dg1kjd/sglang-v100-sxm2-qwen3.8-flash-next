@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_parallel,
+    mamba_cache_chunk_size,
 )
 from sglang.srt.utils import (
     is_cpu,
@@ -1039,7 +1040,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.extend_prefix_lens is None
         ):
             return None
-        chunk_size = get_global_server_args().mamba_cache_chunk_size
+        chunk_size = mamba_cache_chunk_size()
         lens_to_track = self.mamba_track_seqlens - self.extend_prefix_lens
         return (lens_to_track // chunk_size) * chunk_size
 
