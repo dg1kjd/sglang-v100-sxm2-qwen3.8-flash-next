@@ -16,9 +16,10 @@ what it does, so you can run the steps individually when one fails.
 
 - 4× V100 32 GB. SXM2 preferred; NVLink helps but a partial mesh is fine (the
   custom all-reduce is pinned to single-stage for exactly that case).
-- 340 GB+ host RAM. The PLE n-gram table is host-resident and the hierarchical
-  KV cache wants the rest.
-- ~250 GB disk for the model, plus room for the disk cache tier.
+- ~134 GB host RAM measured in use at 262K context with `--hicache-size 8`;
+  160 GB is a comfortable floor. The PLE n-gram table is host-resident and
+  the hierarchical KV cache scales with `--hicache-size`.
+- 126 GB disk for the weights, plus room for the disk cache tier.
 
 ### CUDA
 
@@ -68,8 +69,8 @@ serve script exports both.
 ## 1. Clone
 
 ```bash
-git clone https://github.com/haohervchb/sglang-V100.git
-cd sglang-V100
+git clone https://github.com/dg1kjd/sglang-v100-sxm2-qwen3.8-flash-next.git
+cd sglang-v100-sxm2-qwen3.8-flash-next
 ```
 
 ## 2. Python environment
@@ -175,11 +176,16 @@ pip install --force-reinstall --no-deps nvidia-nccl-cu12==2.27.5
 
 ## 8. Model weights
 
-Fetch the NVFP4 checkpoint of Qwen3.8-Flash-Next and point the launcher at it:
-
 ```bash
-export FLASH_NEXT_MODEL=/path/to/Qwen3.8-Flash-Next-NVFP4
+pip install -U "huggingface_hub[cli]"
+hf download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  --local-dir ~/models/Qwen3.8-Flash-Next-NVFP4
+
+export FLASH_NEXT_MODEL=~/models/Qwen3.8-Flash-Next-NVFP4
 ```
+
+126 GB. This is the NVFP4 quantisation of `Qwen/Qwen3.8-Flash-Next`; the
+launcher's `--quantization modelopt_fp4` expects exactly this format.
 
 Sanity-check that it is the multimodal export if you want vision:
 

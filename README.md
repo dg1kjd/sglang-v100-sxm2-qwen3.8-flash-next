@@ -62,8 +62,8 @@ system, not estimated.
 ## Quick start
 
 ```bash
-git clone https://github.com/haohervchb/sglang-V100.git
-cd sglang-V100
+git clone https://github.com/dg1kjd/sglang-v100-sxm2-qwen3.8-flash-next.git
+cd sglang-v100-sxm2-qwen3.8-flash-next
 
 # Full build: system deps, venv, patched FlashInfer, TurboMind, sglang-kernel,
 # Marlin. Takes roughly an hour, most of it nvcc.
@@ -72,6 +72,30 @@ bash scripts/install_v100.sh
 # Verify the SM70 stack registered correctly.
 bash scripts/smoke_v100.sh
 ```
+
+### Get the model
+
+The validated checkpoint is the NVFP4 quantisation of Qwen3.8-Flash-Next:
+
+```bash
+pip install -U "huggingface_hub[cli]"
+hf download RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  --local-dir ~/models/Qwen3.8-Flash-Next-NVFP4
+
+export FLASH_NEXT_MODEL=~/models/Qwen3.8-Flash-Next-NVFP4
+```
+
+126 GB. It is the multimodal export, so the vision tower comes with it — check
+`language_model_only: false` in `config.json` if in doubt.
+
+| | |
+|---|---|
+| checkpoint | [`RadixArk/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) |
+| base model | [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) |
+| quantisation | NVFP4 W4A16 (modelopt), FP8-E5M2 KV cache at runtime |
+
+Other checkpoints of the same architecture should work but are untested here.
+The model is subject to its own license, which you must satisfy independently.
 
 Step-by-step instructions, and what to do when a step fails, are in
 **[docs/v100/INSTALL.md](docs/v100/INSTALL.md)**.
