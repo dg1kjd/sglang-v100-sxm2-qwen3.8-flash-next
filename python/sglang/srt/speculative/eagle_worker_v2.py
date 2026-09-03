@@ -126,20 +126,32 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
-def _optional_mla_graph_backend_types() -> list:
-    """MLA draft-extend backends that support CUDA-graph capture, imported here
-    rather than at module scope.
+# Draft-extend CUDA-graph backends that are optional in a Volta build. A gate
+# on `_is_cuda` is not enough -- V100 *is* CUDA -- and each of these reaches a
+# stack that is absent here: trtllm_mla_backend pulls the flashinfer MLA
+# wrappers, which the SM70 flashinfer build does not ship, and dsa_backend /
+# deepseek_v4_backend pull `deep_gemm`, an sm90+ package.
+_MLA_GRAPH_BACKENDS = (
+    ("sglang.srt.layers.attention.trtllm_mla_backend", "TRTLLMMLABackend"),
+    ("sglang.srt.layers.attention.tokenspeed_mla_backend", "TokenspeedMLABackend"),
+)
+_SPARSE_GRAPH_BACKENDS = (
+    ("sglang.srt.layers.attention.dsa_backend", "DeepseekSparseAttnBackend"),
+    ("sglang.srt.layers.attention.deepseek_v4_backend", "DeepseekV4AttnBackend"),
+)
+_FLASHMLA_GRAPH_BACKENDS = (
+    ("sglang.srt.layers.attention.flashmla_backend", "FlashMLABackend"),
+)
 
-    `trtllm_mla_backend` reaches `flashinfer_mla_backend`, which imports the
-    flashinfer MLA wrappers at module scope; the SM70 (Volta) flashinfer build
-    ships no such API, so the import raises there. A non-MLA EAGLE worker never
-    builds these backends, and a missing one only narrows the isinstance test.
+
+def _optional_graph_backend_types(specs) -> list:
+    """Import the given backends, skipping any this build cannot provide.
+
+    A non-MLA, non-sparse EAGLE worker never builds these, and a missing one
+    only narrows the isinstance test at the call site.
     """
     backend_types = []
-    for module_path, class_name in (
-        ("sglang.srt.layers.attention.trtllm_mla_backend", "TRTLLMMLABackend"),
-        ("sglang.srt.layers.attention.tokenspeed_mla_backend", "TokenspeedMLABackend"),
-    ):
+    for module_path, class_name in specs:
         try:
             module = importlib.import_module(module_path)
         except ImportError as e:
@@ -457,29 +469,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             TritonAttnBackend,
             # TRTLLMHAAttnBackend subclasses FlashInferAttnBackend, so it needs
             # no entry of its own -- and no module-scope import (see
-            # _optional_mla_graph_backend_types).
+            # _optional_graph_backend_types).
             FlashInferAttnBackend,
         ]
         if _is_cuda or _is_musa:
-            graph_supported_backend_types.extend(_optional_mla_graph_backend_types())
-            # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
-            # deep_gemm and the rest of the sparse-attention stack at import time.
-            from sglang.srt.layers.attention.dsa_backend import (
-                DeepseekSparseAttnBackend,
+            graph_supported_backend_types.extend(
+                _optional_graph_backend_types(
+                    _MLA_GRAPH_BACKENDS + _SPARSE_GRAPH_BACKENDS
+                )
             )
-
-            graph_supported_backend_types.append(DeepseekSparseAttnBackend)
-            from sglang.srt.layers.attention.deepseek_v4_backend import (
-                DeepseekV4AttnBackend,
-            )
-
-            graph_supported_backend_types.append(DeepseekV4AttnBackend)
         if _is_cuda:
-            # FlashMLA is CUDA-only; import lazily so CPU builds don't pull
-            # sgl_kernel.flash_mla at import time.
-            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
-
-            graph_supported_backend_types.append(FlashMLABackend)
+            graph_supported_backend_types.extend(
+                _optional_graph_backend_types(_FLASHMLA_GRAPH_BACKENDS)
+            )
 
         graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,
