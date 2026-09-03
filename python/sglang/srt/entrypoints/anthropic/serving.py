@@ -697,17 +697,19 @@ class AnthropicServing:
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
 
         # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
-        # ``reasoning_effort`` knob. ``xhigh`` collapses to ``max`` because
-        # the OpenAI Literal does not include the Anthropic-only ``xhigh``.
+        # ``reasoning_effort`` knob. Forwarded unchanged -- ``ReasoningEffortTier``
+        # has included ``xhigh`` since 02236fa38, so the old collapse of
+        # ``xhigh`` -> ``max`` is no longer needed, and it actively broke
+        # templates whose accepted set includes ``xhigh`` but not ``max``
+        # (Qwen3.8-Flash-Next accepts exactly xhigh/medium/low, so a client
+        # asking for xhigh got a 500).
         # ``task_budget`` is a soft hint forwarded as a custom param so the
         # model can see it without it becoming a hard cap (``max_tokens``
         # is still the hard cap).
         if anthropic_request.output_config is not None:
             oc = anthropic_request.output_config
             if oc.effort is not None:
-                chat_request.reasoning_effort = (
-                    "max" if oc.effort == "xhigh" else oc.effort
-                )
+                chat_request.reasoning_effort = oc.effort
             if oc.task_budget is not None:
                 # Custom params are silently ignored by backends that
                 # don't recognise them; logging it makes the propagation
