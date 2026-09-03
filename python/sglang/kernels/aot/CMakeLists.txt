@@ -433,7 +433,12 @@ endif()
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file
 # Now FA3 support sm80/sm86/sm90
-if (SGL_KERNEL_ENABLE_FA3)
+# FA3 is Hopper-only: SGL_FLASH_KERNEL_CUDA_FLAGS below hardcodes
+# compute_90a, so SGL_KERNEL_V100_ONLY must skip the whole target, not just
+# drop sm90a from the shared gencode list. It is the largest single chunk of a
+# build, and nothing reaches it on sm70 -- sgl_kernel.flash_attn is imported
+# only from _load_fa3_kernel_from_sgl(), behind the `fa3` attention backend.
+if (SGL_KERNEL_ENABLE_FA3 AND NOT SGL_KERNEL_V100_ONLY)
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
         "-DOPERATOR_NAMESPACE=sgl-kernel"
