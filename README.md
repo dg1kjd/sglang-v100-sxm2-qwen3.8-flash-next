@@ -137,7 +137,11 @@ a failure.
 
 ## What the port adds
 
-Everything below is fork-owned; none of it exists upstream.
+None of this exists upstream. **The Volta port itself is the work of
+[haohervchb](https://github.com/haohervchb/sglang-V100)** — the sm70 kernels, the model support and the serving
+recipe below are all theirs. This repository re-lands that work onto a much
+newer SGLang and fixes what the move broke; see
+[Relationship to upstream](#relationship-to-upstream).
 
 - **NVFP4 W4A16 on sm70** — a JIT CUDA path for FP4 weights on hardware with no
   FP4 support, plus the Marlin V100 GPTQ/AWQ repack kernels.
@@ -175,8 +179,11 @@ Open items are tracked in [`docs/v100/KNOWN-ISSUES.md`](docs/v100/KNOWN-ISSUES.m
 
 ## Relationship to upstream
 
-This is a fork of [sgl-project/sglang](https://github.com/sgl-project/sglang),
-re-based onto upstream `main` as of 2026-09-02 (`99b910955`). Upstream's engine
+This is a downstream of [haohervchb/sglang-V100](https://github.com/haohervchb/sglang-V100), which is itself a fork
+of [sgl-project/sglang](https://github.com/sgl-project/sglang). The V100 port
+was cut from upstream around 2026-06-01 and had not been re-synced since; this
+repository re-lands it onto upstream `main` as of 2026-09-02 (`99b910955`),
+about 4,250 commits later. Upstream's engine
 — including the unified radix cache, the hierarchical KV cache and the
 speculative decoding stack — is used as-is wherever possible; this fork adds the
 sm70 layer and the Qwen3.8-Flash-Next model support on top.
@@ -191,9 +198,19 @@ belong upstream.
 
 ## Credits
 
-This is a derivative work of [SGLang](https://github.com/sgl-project/sglang)
-(Apache 2.0, Copyright 2023-2024 SGLang Team). Upstream does the hard part; this
-fork adds a Volta layer on top.
+**The Volta port is [haohervchb](https://github.com/haohervchb/sglang-V100)'s work.** Every sm70 kernel in here —
+the TileLang attention backend, QSA, the GDN linear-attention kernels, NVFP4 on
+hardware with no FP4 support, the TurboMind sm70 backend, the PLE host offload,
+the Qwen4-Exp model support — was written there, along with the serving recipe
+and the tuning that makes it fit in 32 GB. If this is useful to you, that is
+where the credit belongs. The patched sm70 FlashInfer the build uses is also
+theirs ([haohervchb/flashinfer](https://github.com/haohervchb/flashinfer)).
+
+This repository's contribution is narrower: re-landing that port onto an SGLang
+roughly 4,250 commits newer, and fixing what the move broke.
+
+Both are derivative works of [SGLang](https://github.com/sgl-project/sglang)
+(Apache 2.0, Copyright 2023-2024 SGLang Team), which does the hard part.
 
 The Volta build also stands on
 [marlin_v100](https://github.com/zhinianqin/marlin_v100),

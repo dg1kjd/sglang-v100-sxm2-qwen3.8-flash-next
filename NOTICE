@@ -1,12 +1,19 @@
 SGLang V100
 ===========
 
-This project is a derivative work of SGLang, adding Volta (sm70) support.
+This project is a derivative work of two upstreams.
 
-    SGLang
+    SGLang -- the inference engine
     https://github.com/sgl-project/sglang
     Copyright 2023-2024 SGLang Team
     Licensed under the Apache License, Version 2.0
+
+    sglang-V100 -- the Volta (sm70) port
+    https://github.com/haohervchb/sglang-V100
+    The sm70 kernels, the Qwen4-Exp model support and the serving recipe
+    carried here originate in that repository. This repository re-lands that
+    work onto a newer SGLang; it did not author the port.
+    See also https://github.com/haohervchb/flashinfer (the patched sm70 FlashInfer).
 
 This is an independent, community fork. It is not affiliated with, endorsed by,
 or supported by the SGLang project or LMSYS. Please do not file issues about
