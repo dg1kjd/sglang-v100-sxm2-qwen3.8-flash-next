@@ -11,12 +11,11 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.kernels.sm70_paths import sm70_prebuilt
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_OPS_PATH = (
-    Path(__file__).resolve().parents[3] / "jit_kernel" / "_sm70_turbomind_v100.so"
-)
+_DEFAULT_OPS_PATH = sm70_prebuilt("_sm70_turbomind_v100.so")
 _OPS_LOAD_ATTEMPTED = False
 _OPS_AVAILABLE = False
 _LOGGED_CONFIGS: set[tuple[int, int, int, int]] = set()

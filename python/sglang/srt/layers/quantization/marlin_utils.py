@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
+from sglang.kernels.sm70_paths import sm70_prebuilt_dir
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
@@ -126,9 +127,7 @@ def _sm70_marlin_v100_repack_ops():
     # directory and ~/marlin_v100, so container images (which intentionally do
     # not retain the full source checkout) silently fell back to SGLang's SM80+
     # zero-output repack stub on V100.
-    jit_kernel_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(here))), "jit_kernel"
-    )
+    jit_kernel_dir = str(sm70_prebuilt_dir())
     home = os.path.expanduser("~")
     candidates = sorted(
         glob.glob(os.path.join(jit_kernel_dir, "_sm70_marlin_v100_dense*.so"))

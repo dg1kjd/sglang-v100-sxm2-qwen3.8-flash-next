@@ -9,6 +9,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.kernels.sm70_paths import sm70_prebuilt_dir
 
 if TYPE_CHECKING:
     from sgl_kernel.scalar_type import ScalarType
@@ -125,6 +126,9 @@ def _load_marlin_v100_op():
     candidates = []
     # 1. installed next to sglang's jit_kernel package (setup_v100_marlin.sh)
     candidates += sorted(glob.glob(os.path.join(here, "_sm70_marlin_v100_moe*.so")))
+    candidates += sorted(
+        glob.glob(os.path.join(str(sm70_prebuilt_dir()), "_sm70_marlin_v100_moe*.so"))
+    )
     # 2. dev build in a ~/marlin_v100 checkout
     candidates += sorted(glob.glob(os.path.join(home, "marlin_v100", "vllm", "_moe_C*.so")))
 

@@ -18,15 +18,11 @@ import os
 from pathlib import Path
 
 import torch
+from sglang.kernels.sm70_paths import sm70_csrc
 
 logger = logging.getLogger(__name__)
 
-_SRC_PATH = (
-    Path(__file__).resolve().parents[4]
-    / "jit_kernel"
-    / "csrc"
-    / "sm70_longctx_decode.cu"
-)
+_SRC_PATH = sm70_csrc("sm70_longctx_decode.cu")
 _EXT = None
 _OPS_LOAD_ATTEMPTED = False
 

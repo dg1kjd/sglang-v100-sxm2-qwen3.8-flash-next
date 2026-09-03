@@ -9,12 +9,11 @@ from typing import Optional
 
 import torch
 from torch.nn.parameter import Parameter
+from sglang.kernels.sm70_paths import sm70_csrc, sm70_prebuilt
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_OPS_PATH = (
-    Path(__file__).resolve().parents[3] / "jit_kernel" / "_sm70_turbomind_v100.so"
-)
+_DEFAULT_OPS_PATH = sm70_prebuilt("_sm70_turbomind_v100.so")
 _OPS_LOAD_ATTEMPTED = False
 _OPS_AVAILABLE = False
 
@@ -26,12 +25,7 @@ _PREFILL_BACKENDS = ("auto", "turbomind", "fp16")
 # once at weight load; decode GEMMs (M<=8) route to the QPN8 kernel instead
 # of the TurboMind fp8_gemm when enabled. The exact TP4 gate/up shape
 # additionally fuses its paired projections with the SiLU multiply at decode.
-_QPN8_SRC_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "jit_kernel"
-    / "csrc"
-    / "sm70_fp8_qpn8_decode.cu"
-)
+_QPN8_SRC_PATH = sm70_csrc("sm70_fp8_qpn8_decode.cu")
 _QPN8_EXT = None
 _QPN8_EXACT_DENSE_SHAPES = {
     "down_proj": (5120, 4352),

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+from sglang.kernels.sm70_paths import sm70_prebuilt
 
 _OP = None
 _CHECKED = False
@@ -19,6 +20,8 @@ def _get_op():
     namespace = getattr(torch.ops, "sglang_sm70_turbomind", None)
     if namespace is None or not hasattr(namespace, "fp8_e5m2_cache_write"):
         library = Path(__file__).with_name("_sm70_turbomind_v100.so")
+        if not library.is_file():
+            library = sm70_prebuilt("_sm70_turbomind_v100.so")
         if not library.is_file():
             return None
         try:

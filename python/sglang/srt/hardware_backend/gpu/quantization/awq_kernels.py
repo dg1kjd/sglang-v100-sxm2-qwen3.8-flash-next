@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
 from sglang.srt.utils import is_hip, is_xpu
+from sglang.kernels.sm70_paths import sm70_prebuilt
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -62,11 +63,7 @@ _SM70_TURBOMIND_OPS_AVAILABLE = False
 _SM70_AWQ_PREFILL_DENSE_OOM_WARNED = False
 _SM70_AWQ_PREFILL_DENSE_LOGGED = False
 _SM70_AWQ_TURBOMIND_LOGGED = False
-_SM70_TURBOMIND_OPS_PATH = (
-    Path(__file__).resolve().parents[4]
-    / "jit_kernel"
-    / "_sm70_turbomind_v100.so"
-)
+_SM70_TURBOMIND_OPS_PATH = sm70_prebuilt("_sm70_turbomind_v100.so")
 
 
 def _env_flag(name: str, default: str) -> bool:
