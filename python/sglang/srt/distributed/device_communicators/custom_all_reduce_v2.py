@@ -360,12 +360,25 @@ class CustomAllReduceV2:
     def _pick_config(self, nbytes: int, can_use_graph: bool) -> AllReduceConfig | None:
         # TODO: refactor this along with the config file
         heuristic = self.config.graph if can_use_graph else self.config.eager
+        # Forcing a family must not also bypass the capacity guard: a config
+        # returned for a tensor larger than the workspace overruns it inside the
+        # kernel ("slice [0, N) escapes the M-byte pull workspace"). None means
+        # "not eligible for custom all-reduce", i.e. fall back to NCCL, which is
+        # what the unforced path below does for the same sizes.
         if _FORCED_ALGO_FAMILY == "one_shot":
             if nbytes <= heuristic.one_shot_push_threshold:
                 return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
-            return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
+            if nbytes <= self.max_pull_size:
+                return AllReduceConfig(
+                    AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph
+                )
+            return None
         if _FORCED_ALGO_FAMILY == "two_shot":
-            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph)
+            if nbytes <= self.max_pull_size:
+                return AllReduceConfig(
+                    AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph
+                )
+            return None
         can_use_multicast = self.config.num_mc_blocks is not None
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
