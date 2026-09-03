@@ -1071,7 +1071,30 @@ class KVCacheConfigurator:
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "(kimi_linear) model; got a non-KDA model."
             )
-        req_to_token_pool = HybridReqToTokenPool(
+        # Qwen4-Exp additionally carries per-request PLE n-gram history and
+        # short-conv state whose lifetime is the mamba slot's; they need a pool
+        # that drags them through clear / copy / host round-trip in lockstep.
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+        pool_cls = HybridReqToTokenPool
+        ple_kwargs = {}
+        if isinstance(self.mambaish_config, Qwen4ExpTextConfig):
+            from sglang.srt.mem_cache.qwen4_exp_pools import Qwen4ExpReqToTokenPool
+
+            pool_cls = Qwen4ExpReqToTokenPool
+            ple_kwargs = dict(
+                short_conv_layer_ids=[
+                    i
+                    for i in self.mambaish_config.short_conv_layer_ids
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                ],
+                short_conv_state_shape=self.mambaish_config.short_conv_state_shape,
+                ngram_context_len=self.mambaish_config.ngram_context_len,
+                ngram_eos_token_id=int(self.mambaish_config.eos_token_id),
+            )
+
+        req_to_token_pool = pool_cls(
+            **ple_kwargs,
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
@@ -1744,6 +1767,12 @@ class KVCacheConfigurator:
         req_to_token_pool: ReqToTokenPool,
         mha_pool_class: type,
     ) -> KVCache:
+        from sglang.srt.layers.attention.qsa.config import (
+            QSA_VARIANT_COMPRESSED,
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
         extra_args = {}
         if self.use_mla_backend:
             extra_args = {
@@ -1769,7 +1798,7 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
         )
-        token_to_kv_pool = HybridLinearKVPool(
+        common_kwargs = dict(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
@@ -1783,11 +1812,35 @@ class KVCacheConfigurator:
             mamba_pool=req_to_token_pool.mamba_pool,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
-            use_mla=self.use_mla_backend,
             start_layer=self.layer_info.start_layer,
             full_kv_pool_class=full_pool_class,
             quant_method=quant_method,
             post_capture_active=self.post_capture_kv_active and quant_method is None,
+        )
+
+        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        if qsa_profile is not None and qsa_profile.variant == QSA_VARIANT_COMPRESSED:
+            # Qwen4-Exp's sparse full-attention layers need the compressed index
+            # caches; the plain hybrid pool carries none of the qsa_* buffers and
+            # the QSA backend reads pool.qsa_compressed_page_size directly. The
+            # MTP layer is itself a QSA layer, so draft workers get this pool too
+            # rather than a bare hybrid one. QSA is never MLA, so use_mla and the
+            # MLA extra_args do not apply.
+            return QSATokenToKVPool(
+                **common_kwargs,
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_compress_ratio=qsa_profile.compress_ratio,
+                qsa_token_topk=qsa_profile.budget,
+                # The indexer's RMSNorm runs in the model dtype; the full-KV
+                # cache may be fp8, so this must not follow kv_cache_dtype.
+                index_state_dtype=self.model_config.dtype,
+                num_request_slots=req_to_token_pool.req_to_token.shape[0],
+            )
+
+        token_to_kv_pool = HybridLinearKVPool(
+            **common_kwargs,
+            use_mla=self.use_mla_backend,
             **extra_args,
         )
         return token_to_kv_pool

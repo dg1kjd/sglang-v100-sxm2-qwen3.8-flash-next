@@ -8,9 +8,14 @@ from pathlib import Path
 
 import torch
 
+from sglang.kernels.sm70_paths import sm70_csrc
+
 logger = logging.getLogger(__name__)
 
-_SRC_PATH = Path(__file__).with_name("csrc") / "sm70_nvfp4_moe_decode.cu"
+# The .cu lives in the shared JIT csrc tree, not beside this wrapper: the
+# wrapper moved to kernels/ops/moe/ while the sources moved to
+# kernels/jit/csrc/ (RFC #29630).
+_SRC_PATH = sm70_csrc("sm70_nvfp4_moe_decode.cu")
 _EXT = None
 _LOAD_ATTEMPTED = False
 
