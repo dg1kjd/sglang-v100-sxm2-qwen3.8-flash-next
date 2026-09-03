@@ -71,9 +71,9 @@ lmdeploy_sources = [
     "src/turbomind/kernels/gemm/kernel/sm70_884_16.cu",
 ]
 sources = [
-    str(repo / "python/sglang/jit_kernel/csrc/sm70_turbomind_bindings.cpp"),
-    str(repo / "python/sglang/jit_kernel/csrc/sm70_fp8_e5m2_cache.cu"),
-    str(repo / "python/sglang/jit_kernel/csrc/sm70_fp16_moe_gemm.cu"),
+    str(repo / "python/sglang/kernels/jit/csrc/sm70_turbomind_bindings.cpp"),
+    str(repo / "python/sglang/kernels/jit/csrc/sm70_fp8_e5m2_cache.cu"),
+    str(repo / "python/sglang/kernels/jit/csrc/sm70_fp16_moe_gemm.cu"),
     *(str(lmdeploy / path) for path in lmdeploy_sources),
     str(tm_root / "ops/tm_registry_sm70.cu"),
     str(tm_root / "ops/awq_sm70_gemm.cu"),
@@ -110,6 +110,6 @@ extension = load(
     is_python_module=False,
     verbose=True,
 )
-destination = repo / "python/sglang/jit_kernel/_sm70_turbomind_v100.so"
+destination = repo / "python/sglang/kernels/prebuilt/_sm70_turbomind_v100.so"
 shutil.copy2(extension, destination)
 print(f"Installed {destination}")

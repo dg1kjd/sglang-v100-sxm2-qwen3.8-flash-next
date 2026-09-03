@@ -5,8 +5,8 @@
 #
 # Builds https://github.com/zhinianqin/marlin_v100 against the *currently
 # active* Python env's torch (must match the torch SGLang will run with),
-# then installs the resulting MoE extension next to SGLang's jit_kernel
-# package so it is auto-detected at runtime on SM70 (no env var needed).
+# then installs the resulting MoE extension into SGLang's SM70 prebuilt dir
+# so it is auto-detected at runtime on SM70 (no env var needed).
 #
 # Usage (from any directory):
 #   conda activate sglang-v100            # or whichever env runs sglang
@@ -146,21 +146,23 @@ SO_MOE="$(ls "$REPO"/vllm/_moe_C*.so 2>/dev/null | head -1 || true)"
 [[ -f "$SO_MOE" ]] || die "build finished but $REPO/vllm/_moe_C*.so was not produced."
 log "built MoE extension: $SO_MOE"
 
-# --- install next to sglang's jit_kernel package --------------------------------
+# --- install into SGLang's SM70 prebuilt dir ------------------------------------
+# RFC #29630 retired sglang.jit_kernel; sglang.kernels.sm70_paths is now the one
+# place that knows where the prebuilt .so live, and the runtime loaders read it too.
 if [[ -n "${MARLIN_V100_INSTALL_DIR:-}" ]]; then
   PKG_DIR="$MARLIN_V100_INSTALL_DIR"
-  mkdir -p "$PKG_DIR"
 else
-  PKG_DIR="$("$PYTHON" - <<'PY' || die "could not locate sglang.jit_kernel package dir."
-import os
+  PKG_DIR="$("$PYTHON" - <<'PYPATH' || die "could not locate the SGLang SM70 prebuilt dir."
 try:
-    import sglang.jit_kernel as jk
+    from sglang.kernels.sm70_paths import sm70_prebuilt_dir
 except Exception as e:
-    raise SystemExit(f"cannot import sglang.jit_kernel: {e}")
-print(os.path.dirname(os.path.abspath(jk.__file__)))
-PY
+    raise SystemExit(f"cannot import sglang.kernels.sm70_paths: {e}")
+print(sm70_prebuilt_dir())
+PYPATH
 )"
 fi
+mkdir -p "$PKG_DIR"
+
 DEST="$PKG_DIR/_sm70_marlin_v100_moe.abi3.so"
 cp -f "$SO_MOE" "$DEST"
 log "installed -> $DEST"

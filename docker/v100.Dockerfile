@@ -116,12 +116,12 @@ RUN git clone --filter=blob:none https://github.com/NVIDIA/cutlass.git \
 # Build SGLang's adapter for the attributed TurboMind W8A16 block-FP8 and
 # FP16 MoE source against the pinned CUTLASS revision used for host validation.
 COPY scripts/build_sm70_turbomind.py /opt/sglang/scripts/build_sm70_turbomind.py
-COPY python/sglang/jit_kernel/csrc/sm70_turbomind_bindings.cpp \
-     /opt/sglang/python/sglang/jit_kernel/csrc/sm70_turbomind_bindings.cpp
-COPY python/sglang/jit_kernel/csrc/sm70_fp16_moe_gemm.cu \
-     /opt/sglang/python/sglang/jit_kernel/csrc/sm70_fp16_moe_gemm.cu
-COPY python/sglang/jit_kernel/csrc/sm70_fp8_e5m2_cache.cu \
-     /opt/sglang/python/sglang/jit_kernel/csrc/sm70_fp8_e5m2_cache.cu
+COPY python/sglang/kernels/jit/csrc/sm70_turbomind_bindings.cpp \
+     /opt/sglang/python/sglang/kernels/jit/csrc/sm70_turbomind_bindings.cpp
+COPY python/sglang/kernels/jit/csrc/sm70_fp16_moe_gemm.cu \
+     /opt/sglang/python/sglang/kernels/jit/csrc/sm70_fp16_moe_gemm.cu
+COPY python/sglang/kernels/jit/csrc/sm70_fp8_e5m2_cache.cu \
+     /opt/sglang/python/sglang/kernels/jit/csrc/sm70_fp8_e5m2_cache.cu
 RUN --mount=type=cache,target=/root/.cache/torch_extensions,sharing=locked \
     export MAX_JOBS="$(v100-safe-jobs)" \
     && export SGLANG_TURBOMIND_SM70_ROOT=/opt/deps/turbomind-sm70-source \
@@ -130,17 +130,17 @@ RUN --mount=type=cache,target=/root/.cache/torch_extensions,sharing=locked \
 
 # Only this source tree invalidates the sglang-kernel layer. The context ignores
 # all local .so/build outputs, preventing the stale-binary bug from the host.
-COPY sgl-kernel /opt/sglang/sgl-kernel
+COPY python/sglang/kernels/aot /opt/sglang/python/sglang/kernels/aot
 RUN python -m pip uninstall -y sglang-kernel || true
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    find /opt/sglang/sgl-kernel/python/sgl_kernel \
+    find /opt/sglang/python/sglang/kernels/aot/python/sgl_kernel \
       -type f -name 'common_ops*.so' -delete \
     && JOBS="$(v100-safe-jobs)" \
     && export MAX_JOBS="${JOBS}" \
     && export CMAKE_BUILD_PARALLEL_LEVEL="${JOBS}" \
     && export CMAKE_ARGS="-DSGL_KERNEL_V100_ONLY=ON -DSGL_KERNEL_COMPILE_THREADS=1" \
     && python -m pip install --no-deps --no-build-isolation \
-      /opt/sglang/sgl-kernel
+      /opt/sglang/python/sglang/kernels/aot
 
 # Marlin uses the dedicated marlin_v100 repository and the exact proven local
 # compatibility/tuning patches. Its smoke test is deferred to the next layer.
@@ -172,7 +172,7 @@ RUN --mount=type=bind,source=rust/sglang-grpc,target=/mnt/sglang-grpc,ro \
     && python -m pip install --no-deps --no-build-isolation -e /opt/sglang/python \
     && python -m pip install cuda-tile==1.5.0 \
     && cp /opt/v100-artifacts/_sm70_marlin_v100_*.abi3.so \
-      /opt/sglang/python/sglang/jit_kernel/
+      /opt/sglang/python/sglang/kernels/prebuilt/
 
 # GPU-independent artifact validation is intentionally after every expensive
 # compilation RUN, so BuildKit retains those layers if this check ever changes.
@@ -185,7 +185,7 @@ site = Path("/opt/venv/lib/python3.12/site-packages")
 common_ops = list((site / "sgl_kernel" / "sm70").glob("common_ops*.so"))
 assert len(common_ops) == 1, common_ops
 assert common_ops[0].name == "common_ops.abi3.so", common_ops[0]
-marlin_dir = Path("/opt/sglang/python/sglang/jit_kernel")
+marlin_dir = Path("/opt/sglang/python/sglang/kernels/prebuilt")
 marlin = [
     marlin_dir / "_sm70_marlin_v100_dense.abi3.so",
     marlin_dir / "_sm70_marlin_v100_moe.abi3.so",

@@ -220,7 +220,7 @@ log "Building lean SM70-only sglang-kernel"
 python -m pip uninstall -y sglang-kernel || true
 # A prior in-place build can leave an ignored CPython .so inside the source
 # package. pip then silently bundles it beside the fresh ABI3 SM70 extension.
-find "$REPO_ROOT/sgl-kernel/python/sgl_kernel" \
+find "$REPO_ROOT/python/sglang/kernels/aot/python/sgl_kernel" \
   -type f -name 'common_ops*.so' -delete
 python - <<'PY'
 import site
@@ -231,7 +231,8 @@ for root in site.getsitepackages():
         artifact.unlink()
 PY
 export CMAKE_ARGS="-DSGL_KERNEL_V100_ONLY=ON -DSGL_KERNEL_COMPILE_THREADS=$NVCC_THREADS"
-python -m pip install --no-deps --no-build-isolation "$REPO_ROOT/sgl-kernel"
+python -m pip install --no-deps --no-build-isolation \
+  "$REPO_ROOT/python/sglang/kernels/aot"
 
 log "Restoring the CUDA 12 NCCL required by torch 2.9.1"
 python -m pip uninstall -y nvidia-nccl-cu13 || true
