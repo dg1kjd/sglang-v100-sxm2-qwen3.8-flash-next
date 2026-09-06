@@ -1,70 +1,127 @@
 # Syncing with upstream SGLang
 
-Measured 2026-09-03, after the re-land was validated.
+The fork tracks two upstreams. Check both.
 
 | | |
 |---|---|
-| validated pin | `99b910955` (2026-09-02 17:51 +0800) |
-| upstream now | `27b7a2dc3` (2026-09-03 17:37 +0800) |
-| new commits | **53** |
-| files changed | **1,585** |
-| overlap with the 167 files we hand-resolved | **83** |
+| `sgl-project/sglang` | the engine; moves ~70 commits/day |
+| `haohervchb/sglang-V100` | the Volta port this fork re-lands; last moved `72ef2f5f3`, 2026-09-01, and is fully contained here |
 
-## Recommendation: do not merge these 53 yet
+## Measured: syncing 214 commits (2026-09-07)
 
-Not because they are unwelcome, but because of *one* of them.
+Second sync since the re-land, `99b910955` -> `31d28a296`. This is the
+reference data point for what a sync of this size actually costs.
 
-`28262c20d [CI][RFC] Replace black-jupyter with ruff-format (#37210)` is a
-**tree-wide reformat: 1,411 files, +7,767 / -8,177**. That single commit is why
-53 commits touch 1,585 files, and why 83 of our 167 hand-resolved files are in
-the overlap. Merging it as-is would re-conflict most of the re-land's careful
-work against changes that carry no meaning.
+| | |
+|---|---|
+| new upstream commits | 214 |
+| files upstream touched | 2,410 |
+| files we had touched | 220 |
+| raw file overlap | 59 |
+| overlap after excluding the tree-wide reformat | **14** |
+| **conflicts `git merge` actually produced** | **10** |
+| conflict hunks in total | 12 |
+| new import breakage (G1 sweep) | **0** — byte-identical to pre-merge |
+| AOT kernel rebuild required | no (upstream touched only HIP/ROCm and Python wrappers) |
+| dependency pin changes | none affecting `requirements.txt` |
 
-Upstream shipped `57c26a84e .git-blame-ignore-revs` alongside it, which is the
-tell: they expect tooling, not humans, to absorb it.
+Ten conflicts, all sitting exactly where the sm70 layer meets upstream. Nine
+were one hunk each and additive. That is the shape to expect: the fork's
+surface area against upstream is small and stable, so sync cost scales with
+*how many upstream commits land on that surface*, not with upstream's total
+churn.
 
-## How to absorb it cleanly, when you do sync
+### The reformat is not the problem it looks like
 
-Run the formatter on our side *first*, so the reformat is a no-op by the time
-the merge sees it and only semantic conflicts remain:
+`28262c20d [CI][RFC] Replace black-jupyter with ruff-format (#37210)` reformats
+1,411 files, and it is why the raw overlap is 59 rather than 14. An earlier
+revision of this document predicted it would re-conflict most of the re-land's
+hand-resolved files and prescribed running the formatter on our side first, as
+its own commit, before merging.
 
-1. Adopt upstream's formatter config (the `ruff-format` settings from #37210).
-2. Run `ruff format` over the fork-owned files on a branch off `reland`, and
-   commit that alone -- a pure-formatting commit, verifiable with
-   `ruff format --check` and by confirming the AST is unchanged.
-3. *Then* merge upstream. `rerere` still holds the 155 resolutions from this
-   re-land, so the semantic conflicts that remain should largely replay.
-4. Add our formatting commit to `.git-blame-ignore-revs` too.
+**That was wrong, and the measurement above is the correction.** `merge-ort`
+absorbed the reformat on its own: of the 45 overlap files that exist only
+because of it, *zero* produced a conflict. Reformatting touches whole-file
+whitespace and line wrapping, but our changes sit in different hunks, so the
+three-way merge resolves them independently. Exactly one conflict
+(`marlin_utils.py`, an import line) was formatting-adjacent, and it was a
+two-line resolution.
 
-The `mechanical-refactor-verify` skill in `.claude/skills/` is written for
-exactly this shape: prove the transform is reproducible rather than eyeballing
-a 1,411-file diff.
+So: **merge head-on.** Do not spend a pre-formatting pass on it. The one real
+consequence is cosmetic -- lines the merge takes from our side are not
+ruff-formatted, so `ruff format` reports a diff afterwards. Run it as a
+follow-up commit if you care, and add that commit to `.git-blame-ignore-revs`.
 
-## What is actually worth having from these 53
+## Procedure
 
-Most of the 53 are irrelevant to V100 (AMD/ROCm, XPU, CPU base images, Kimi K3,
-K2 Horizon, docs, CI). The substantive ones that touch our risk areas:
+```bash
+git fetch https://github.com/sgl-project/sglang.git main
+git branch -f sglang_new FETCH_HEAD
 
-- `cf3173aeb` [Perf] Walk the radix tree by offset instead of re-slicing token
-  storage — radix-cache hot path, plausibly a real win for long agentic prefixes.
-- `5ddca6819`, `5a1275a51`, `d9848b9ec`, `18d5ffb42` — unified-SWA / unified
-  read-table fixes. We do not run `--enable-unified-memory`, so these are
-  latent-value only.
-- `87d60a222` Improve CUDA graph and speculative execution output handling —
-  worth reading against our MTP path.
-- `4229088a4` feat(kernels): generalize persistent CuTe JIT cache — could cut
-  the SM70 JIT warm-up cost.
-- `3fa6b8650` [Spec] Publish the final multi-layer EAGLE shared-read event.
+# Size it before committing to it.
+git merge-tree --write-tree reland sglang_new | grep '^CONFLICT'
 
-None of these fixes a problem we currently have. The engine is validated on the
-current pin and beats its performance baseline; a sync is an improvement
-exercise, not a repair.
+git checkout -b sync-<date> reland
+git merge sglang_new
+```
 
-## Cost check for a later sync
+Then, in order:
 
-Upstream moves ~50 commits/day, so drift is ~1 day per 50. The re-land's own
-mechanics (the path-normalisation step, the synthetic graft, the
-import sweep) are all re-runnable, and this document documents the
-procedure. A sync at this size should be hours, not the multi-day effort the
-original 4,250-commit gap required -- provided the reformat is handled as above
-rather than merged head-on.
+1. **Resolve.** `rerere` holds the re-land's 155 resolutions and replays what it
+   can. Read every remaining hunk against the sm70 seams -- upstream adding a
+   parallel mechanism for the same problem (a native-FP8 path next to our
+   software dequant) is the common case, and the answer is usually "keep both,
+   ours first", not "pick a side".
+2. **Scan for markers**, matching 7 *and* 8 characters -- rename/rename
+   conflicts write `<<<<<<<<`:
+   `grep -rlE '^<{7,8}[ A-Za-z]' --include='*.py' python/ test/`
+3. **Byte-compile:** `python -m compileall -q -j 8 python/ test/`
+4. **Run the import sweep** and diff it against the same sweep on `reland`. A
+   sync is clean when the two outputs are *identical*, not when the sweep is
+   empty -- there is known pre-existing residue (dead benchmark files under the
+   old `jit_kernel/` path).
+5. **Check for deleted symbols.** Upstream dedup commits are the real hazard,
+   not conflicts. Extract what a refactor removed and grep the merged tree for
+   survivors:
+   `git show <sha> -- <files> | grep -E '^-(def |class )'`
+6. **Verify the sm70 seams survived** -- the capability guard in
+   `load_model_utils.py`, `SGL_KERNEL_V100_ONLY` in the AOT `CMakeLists.txt`,
+   the `tilelang_fa_v100` selection in `platform_hook.py`.
+7. **Re-run the runtime gates.** Static checks cannot see a wrong Triton merge.
+
+### The trap that matters
+
+Nothing in this fork fails loudly. The stock Marlin MoE kernel is an empty stub
+below sm80 and writes zeros; JIT loaders report "unavailable" and fall back. A
+merge that drops an sm70 branch produces a server that starts, answers, and is
+wrong. Step 7 is not optional, and "it booted" is not step 7.
+
+## What was worth having from these 214
+
+Most are irrelevant to V100 (AMD/ROCm, NPU, XPU, diffusion, router, CI). The
+ones that touch our paths:
+
+- `a74470e90 fix(mamba): unify causal_conv1d col* dtype to x` — upstream landed
+  the *same* fp16/bf16 fix the re-land had made independently. Convergent, and a
+  useful signal that the fork's reading of that kernel was right.
+- `07199fa22 [Performance] Optimize Qwen3.5 GDN prefill projection layouts` and
+  `db89f639e [GDN] Amortize ReplaySSM checkpoint materialization` — the GDN
+  prefill path, which is 36 of this model's 48 layers.
+- `fe45af1e6 perf(gdn): select ReplaySSM verify loop unrolling by shape` — the
+  MTP verify ring.
+- `3c9cea8f1 [EAGLE] Prune draft-extend logits to selected rows` — the MTP path.
+- `cf3173aeb [Perf] Walk the radix tree by offset` — radix-cache hot path.
+- `4229088a4 feat(kernels): generalize persistent CuTe JIT cache` — could cut
+  the sm70 JIT warm-up.
+- `4372b8efa [1/N] Quantization Refactor: dedup the FP4 marlin helpers` — the
+  one to watch. It deletes `marlin_make_empty_zp`,
+  `prepare_moe_fp8_layer_for_marlin` and `MarlinConfig`. Nothing on the sm70
+  path referenced them, but this is the class of change that removes a helper
+  the fork depends on.
+
+## Cost
+
+Upstream moves ~70 commits/day. This sync — 214 commits, three days of drift —
+was hours, and the bounded part (resolve + static gates) was well under one.
+The original 4,250-commit re-land was days. Sync early; the cost is roughly
+linear in commits that land on the sm70 surface, and the surface is small.
