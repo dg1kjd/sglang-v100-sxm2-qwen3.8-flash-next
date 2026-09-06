@@ -2,12 +2,15 @@
 #
 #   sudo cp scripts/sglang-v100.service.example /etc/systemd/system/sglang-v100.service
 #   sudo cp scripts/sglang-v100.env.example     /etc/sglang-v100.env
-#   $EDITOR /etc/sglang-v100.env                # set the paths for your host
+#   sudoedit /etc/systemd/system/sglang-v100.service   # User/Group and the two paths
+#   sudoedit /etc/sglang-v100.env                      # venv, model, port, GPUs
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now sglang-v100
 #
-# Edit User=, Group= and the two absolute paths below to match your install.
-# Everything else is configured through /etc/sglang-v100.env.
+# The paths below are placeholders. Set User=/Group= to the account that owns
+# the checkout and the venv, and point WorkingDirectory= and ExecStart= at
+# wherever you cloned this repository. Everything else is configured through
+# /etc/sglang-v100.env.
 
 [Unit]
 Description=SGLang V100 -- Qwen3.8-Flash-Next on 4x V100 SXM2
@@ -16,11 +19,11 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-User=nvidia
-Group=nvidia
-WorkingDirectory=/home/nvidia/work/sglang-V100
+User=sglang
+Group=sglang
+WorkingDirectory=/opt/sglang-v100
 EnvironmentFile=/etc/sglang-v100.env
-ExecStart=/bin/bash /home/nvidia/work/sglang-V100/scripts/serve_qwen38_flash_next_nvfp4_v100.sh ${SGLANG_V100_MODE}
+ExecStart=/bin/bash /opt/sglang-v100/scripts/serve_qwen38_flash_next_nvfp4_v100.sh ${SGLANG_V100_MODE}
 
 # A cold FlashInfer/sm70 JIT cache compiles on all four ranks at once and can
 # take many minutes. A start timeout would kill it mid-compile, and because the
