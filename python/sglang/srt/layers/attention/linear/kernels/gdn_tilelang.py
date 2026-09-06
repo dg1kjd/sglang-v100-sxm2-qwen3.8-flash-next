@@ -262,8 +262,13 @@ def _run_packed_gdn(
         raise ValueError("TileLang GDN requires FP16 activations on SM70.")
     if ssm_states.dtype not in (torch.float16, torch.float32):
         raise ValueError("TileLang GDN requires an FP16 or FP32 recurrent-state pool.")
-    if mixed_qkv.ndim != 2 or mixed_qkv.stride(-1) != 1:
-        raise ValueError("mixed_qkv must be packed 2D with unit inner stride.")
+    # Unit inner stride is not enough: a column slice of a wider projection
+    # (upstream's qwen3_5_gdn_prefill_projection_views) has stride(-1) == 1 but a
+    # row stride wider than the row, and this kernel addresses row-major dense.
+    # Checking only the inner stride let such a view through and read the wrong
+    # elements -- wrong output, no error.
+    if mixed_qkv.ndim != 2 or not mixed_qkv.is_contiguous():
+        raise ValueError("mixed_qkv must be a contiguous packed 2D tensor.")
     if a.ndim != 2 or b.ndim != 2 or a.shape != b.shape:
         raise ValueError("a and b must have matching [tokens, value_heads] shapes.")
     if a.dtype != torch.float16 or b.dtype != torch.float16:

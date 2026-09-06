@@ -129,6 +129,7 @@ _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_sm70 = _is_cuda and torch.cuda.get_device_capability() == (7, 0)
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = _is_cuda or (
@@ -806,8 +807,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+            # The sm70 TileLang GDN kernels index mixed_qkv/a/b as densely
+            # packed, so upstream's strided projection views read the wrong
+            # elements. Keep the contiguous split on Volta: the copy it does is
+            # the one the kernel would need anyway.
             use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+                _is_cuda
+                and not _is_sm70
+                and forward_batch.forward_mode.is_extend_without_speculative()
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
