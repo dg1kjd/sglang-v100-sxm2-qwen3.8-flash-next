@@ -434,9 +434,9 @@ def fused_sigmoid_mul(
         gate_stride_head = gate.stride(1)
     else:
         # Flat path: both tensors have the same shape
-        assert (
-            attn_output.shape == gate.shape
-        ), "attn_output and gate must have the same shape"
+        assert attn_output.shape == gate.shape, (
+            "attn_output and gate must have the same shape"
+        )
         hidden_dim = attn_output.shape[-1]
         num_tokens = attn_output.numel() // hidden_dim
         head_dim = hidden_dim

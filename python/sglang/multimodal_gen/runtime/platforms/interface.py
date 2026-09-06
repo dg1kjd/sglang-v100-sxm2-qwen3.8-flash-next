@@ -36,6 +36,7 @@ class AttentionBackendEnum(enum.Enum):
     SAGE_ATTN_3 = enum.auto()
     SPARGE_ATTN = enum.auto()
     VIDEO_SPARSE_ATTN = enum.auto()
+    VIDEO_SPARSE_ATTN_H3 = enum.auto()
     SPARSE_VIDEO_GEN_2_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
@@ -58,6 +59,7 @@ class AttentionBackendEnum(enum.Enum):
         return self in {
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3,
             AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.SLA_ATTN,
@@ -391,8 +393,7 @@ class Platform:
         """
         if cls.supported_quantization and quant not in cls.supported_quantization:
             raise ValueError(
-                f"{quant} quantization is currently not supported in "
-                f"{cls.device_name}."
+                f"{quant} quantization is currently not supported in {cls.device_name}."
             )
 
     @classmethod
