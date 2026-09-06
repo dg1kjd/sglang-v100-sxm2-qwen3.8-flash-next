@@ -238,6 +238,28 @@ Ready when the log says:
 The server is fired up and ready to roll!
 ```
 
+## 11. Run it as a service (recommended)
+
+The serve script derives its repo root from its own location and takes the venv
+from `SGLANG_V100_VENV`. That is convenient interactively and a trap over time:
+run a stale checkout's copy of the script, or leave a different venv active, and
+you silently serve the wrong tree. A unit file pins both.
+
+```bash
+sudo cp scripts/sglang-v100.service.example /etc/systemd/system/sglang-v100.service
+sudo cp scripts/sglang-v100.env.example     /etc/sglang-v100.env
+$EDITOR /etc/sglang-v100.env      # venv, model path, port, GPUs
+$EDITOR /etc/systemd/system/sglang-v100.service   # User=, WorkingDirectory=, ExecStart= paths
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now sglang-v100
+journalctl -u sglang-v100 -f
+```
+
+`TimeoutStartSec=infinity` is deliberate: a cold JIT cache compiles on four
+ranks at once, the cache is only written on success, and a start timeout would
+kill it mid-compile every time, so it would never converge.
+
 ---
 
 ## Troubleshooting

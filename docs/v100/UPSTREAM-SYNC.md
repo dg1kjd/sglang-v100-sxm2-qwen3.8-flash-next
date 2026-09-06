@@ -96,6 +96,35 @@ below sm80 and writes zeros; JIT loaders report "unavailable" and fall back. A
 merge that drops an sm70 branch produces a server that starts, answers, and is
 wrong. Step 7 is not optional, and "it booted" is not step 7.
 
+### What the static gates missed, both times
+
+The 214-commit sync passed every static check — no conflict markers, no import
+breakage, no deleted symbol referenced — and still failed to start twice. Both
+failures share a cause worth internalising: **merge-ort does not touch
+fork-only files.** When upstream renames an API and sweeps its own tree, our 67
+fork-only files keep the old name, and nothing in a three-way merge notices.
+
+1. `ForwardBatch.num_token_non_padded_cpu` -> `global_num_token_non_padded_cpu`
+   (#37546). Upstream renamed every in-tree caller. `qwen4_exp.py` is fork-only,
+   so it kept the old name and died with `AttributeError` on the first forward.
+   An *attribute* access — invisible to an import sweep.
+
+2. `resolve_spec_hidden_size` narrowed to DeepSeek-V4 only (#36805), because
+   hy_v4 collapses its hc streams before the draft boundary. Qwen4-Exp does not,
+   so its draft buffer silently came out 2560 wide instead of 10240 and draft
+   graph capture failed on a `CHECK_EQ`. Nothing was renamed or deleted here —
+   a *predicate got narrower*, and our model fell out of it.
+
+The generalisable check, which does catch the first class:
+
+```bash
+# identifiers upstream removed, still referenced by fork-only files
+comm -23 <(git ls-tree -r --name-only HEAD -- python/ | grep '\.py$' | sort) \
+         <(git ls-tree -r --name-only <upstream> -- python/ | grep '\.py$' | sort)
+```
+
+The second class has no static check. It is why step 7 exists.
+
 ## What was worth having from these 214
 
 Most are irrelevant to V100 (AMD/ROCm, NPU, XPU, diffusion, router, CI). The

@@ -1,0 +1,41 @@
+# Example systemd unit for serving Qwen3.8-Flash-Next on 4x V100.
+#
+#   sudo cp scripts/sglang-v100.service.example /etc/systemd/system/sglang-v100.service
+#   sudo cp scripts/sglang-v100.env.example     /etc/sglang-v100.env
+#   $EDITOR /etc/sglang-v100.env                # set the paths for your host
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sglang-v100
+#
+# Edit User=, Group= and the two absolute paths below to match your install.
+# Everything else is configured through /etc/sglang-v100.env.
+
+[Unit]
+Description=SGLang V100 -- Qwen3.8-Flash-Next on 4x V100 SXM2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=nvidia
+Group=nvidia
+WorkingDirectory=/home/nvidia/work/sglang-V100
+EnvironmentFile=/etc/sglang-v100.env
+ExecStart=/bin/bash /home/nvidia/work/sglang-V100/scripts/serve_qwen38_flash_next_nvfp4_v100.sh ${SGLANG_V100_MODE}
+
+# A cold FlashInfer/sm70 JIT cache compiles on all four ranks at once and can
+# take many minutes. A start timeout would kill it mid-compile, and because the
+# cache is only written on success it would never converge.
+TimeoutStartSec=infinity
+TimeoutStopSec=180
+
+# The scheduler ranks are children of the launcher; stop the whole cgroup.
+KillMode=control-group
+KillSignal=SIGTERM
+Restart=on-failure
+RestartSec=20
+
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
