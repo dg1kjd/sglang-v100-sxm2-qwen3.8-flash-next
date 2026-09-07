@@ -73,6 +73,15 @@ bash scripts/install_v100.sh
 bash scripts/smoke_v100.sh
 ```
 
+**Do not skip the smoke check.** No prebuilt kernels are distributed here — the
+`.so` files are build outputs, so a fresh clone has none until
+`install_v100.sh` finishes. That matters more than it sounds: the stock Marlin
+MoE kernel is an empty stub below sm80, so a server missing the V100 kernels
+starts, answers, and returns **zero-valued expert output** — confident nonsense
+rather than an error. `smoke_v100.sh` must report a registration on every line;
+treat the startup warning about `marlin_v100` as fatal. Details in
+[docs/v100/INSTALL.md](docs/v100/INSTALL.md#6-turbomind-sm70-and-marlin-v100).
+
 ### Get the model
 
 The validated checkpoint is the NVFP4 quantisation of Qwen3.8-Flash-Next:
