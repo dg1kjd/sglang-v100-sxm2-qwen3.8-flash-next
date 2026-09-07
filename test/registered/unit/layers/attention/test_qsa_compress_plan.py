@@ -1,11 +1,17 @@
 """The QSA extend compression plan against chunks shorter than one group.
 
-A repeated prompt takes a page-granular prefix-cache hit, so the uncached tail
-can be 1-3 tokens while the compression ratio is 4. The write plan is padded to
-a shape-derived capacity and a padding entry names token row 0, whose group
-window spans rows [0, ratio) of this forward's packed tensors -- rows a short
-chunk does not have. Gathering them killed the engine with a device-side
-assert on every rank.
+An extend chunk can carry fewer token rows than the compression ratio of 4. The
+write plan is padded to a shape-derived capacity and a padding entry names token
+row 0, whose group window spans rows [0, ratio) of this forward's packed tensors
+-- rows a short chunk does not have. Gathering them killed the engine with a
+device-side assert on every rank.
+
+Two independent ways to get such a chunk, both measured on the pre-fix engine:
+a repeated prompt whose page-granular prefix hit leaves a 1-3 token tail, and a
+single cold prompt whose length leaves a 1-3 token remainder past the
+chunked-prefill boundary (4097 tokens at chunked_prefill_size 4096 is enough).
+The second needs no cache, no repetition and no concurrency, so flushing the
+prefix cache is not a workaround.
 """
 
 import unittest
