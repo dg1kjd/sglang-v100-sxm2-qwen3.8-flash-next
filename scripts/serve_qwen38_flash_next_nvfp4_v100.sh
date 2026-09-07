@@ -93,7 +93,15 @@ args=(
   # multi-agent comes from the hierarchical host+disk tiers below, not the GPU.
   --mem-fraction-static 0.85
   --context-length 262144
-  --max-running-requests 4
+  # 3, not 4: measured on this hardware, aggregate decode PEAKS at three
+  # concurrent requests (116.7 tok/s) and falls at four (108.8) while TTFT
+  # jumps 4x, 656 ms -> 2.5 s. The fourth slot buys no throughput and costs
+  # every stream its latency. Per-stream decode is 67/53/43/38 tok/s at
+  # np=1/2/3/4. Measure with realistic text before changing this: a
+  # random-token benchmark reports aggregate still climbing at four, because
+  # random continuations are degenerate and the MTP draft model predicts them
+  # almost perfectly (accept 3.98 of 4, against 2.6-2.7 on real text).
+  --max-running-requests 3
   --max-mamba-cache-size 20
   --chunked-prefill-size 4096
   # Cap total prefill tokens per forward pass at 4096 (was 8192/16384). The
@@ -172,8 +180,11 @@ args=(
   # poller immediately, so no TTFT penalty. (Upstream IdleSleeper exists for
   # exactly this: "each GPU would otherwise pin one thread at 100% CPU".)
   --sleep-on-idle
-  --cuda-graph-max-bs-decode 4
-  --cuda-graph-bs-decode 1 2 4
+  # Track --max-running-requests above: with three admitted requests the decode
+  # batch is only ever 1-3, so capturing a bs=4 graph costs capture time and
+  # memory for a shape that can no longer occur.
+  --cuda-graph-max-bs-decode 3
+  --cuda-graph-bs-decode 1 2 3
   --mamba-radix-cache-strategy extra_buffer
   --mamba-full-memory-ratio 0.2
   # Report prefix-cache hits as usage.prompt_tokens_details.cached_tokens
