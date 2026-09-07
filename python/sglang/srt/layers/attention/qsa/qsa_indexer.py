@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
+
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -318,6 +319,11 @@ class QSAIndexer(MultiPlatformOp):
                 "sparse-attention backend derives it from the batch lengths"
             )
         if metadata.write_locs.numel() == 0:
+            return
+        if is_extend and token_k.shape[0] < self.compress_ratio:
+            # A chunk shorter than one group completes none (prefixes are
+            # ratio-aligned), so every entry here is capacity padding, whose
+            # member window -- rows [0, ratio) of the chunk -- overruns it.
             return
         group_end_positions = metadata.compress_group_positions.long()
         compressed_locs = metadata.write_locs
