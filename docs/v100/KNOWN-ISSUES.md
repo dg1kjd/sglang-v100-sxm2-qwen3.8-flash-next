@@ -98,9 +98,6 @@ Status: `[ ]` open, `[x]` done, `[~]` done in source but unverified at runtime.
   `mem_cache/hi_mamba_radix_cache.py`, which upstream deleted (`12de7fb1f`,
   #33468). The behaviour still exists in `hiradix_cache.py` + `pool_host/mamba.py`;
   only the file reference is stale.
-- [ ] `RELAND-PLAN.md` §2.5 lists `model_runner_kv_cache_mixin.py` as a hard
-  engine file; upstream deleted it (`cfd17301a`, #31163). §5.0 records the
-  correction, but the §2.5 list itself was left as the operator's measured record.
 
 ## Reporting
 

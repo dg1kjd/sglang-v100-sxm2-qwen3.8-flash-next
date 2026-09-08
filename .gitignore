@@ -284,8 +284,7 @@ artifacts/
 # Internal, non-published docs
 internal-docs/
 
-# Re-land working notes: triage output, benchmark harnesses and their results,
-# operator logs, crash evidence. Local working record and correspondence, not
-# source -- the code and tests they produce get committed on their own.
-.reland/
-RELAND-PLAN.md
+# Local working record: triage output, operator logs, crash evidence, benchmark
+# results, planning notes. Not source -- the tools and tests this work produces
+# are committed on their own, under benchmark/ and test/.
+.workbench/
