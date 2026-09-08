@@ -147,6 +147,17 @@ _SPARSE_GRAPH_BACKENDS = (
 _FLASHMLA_GRAPH_BACKENDS = (
     ("sglang.srt.layers.attention.flashmla_backend", "FlashMLABackend"),
 )
+# Hybrid mamba/full-attn models resolve the draft-extend backend to this
+# wrapper, which is not any listed type, so the isinstance test below reads as
+# unsupported and the draft-extend graph is silently skipped. Listing it
+# requires its graph metadata path to honor the DRAFT_EXTEND_V2 special case
+# that init_forward_metadata already applies.
+_HYBRID_GRAPH_BACKENDS = (
+    (
+        "sglang.srt.layers.attention.hybrid_linear_attn_backend",
+        "HybridLinearAttnBackend",
+    ),
+)
 
 
 def _optional_graph_backend_types(specs) -> list:
@@ -494,7 +505,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
         if _is_cuda:
             graph_supported_backend_types.extend(
-                _optional_graph_backend_types(_FLASHMLA_GRAPH_BACKENDS)
+                _optional_graph_backend_types(
+                    _FLASHMLA_GRAPH_BACKENDS + _HYBRID_GRAPH_BACKENDS
+                )
             )
 
         graph_supported_backend = isinstance(

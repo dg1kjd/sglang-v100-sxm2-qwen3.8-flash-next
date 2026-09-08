@@ -3715,6 +3715,10 @@ class SignalHandler:
         logger.warning(
             f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
         )
+        # A process-group SIGTERM reaches the children too: they exit -15 mid-drain,
+        # and the drain's own watchdog stop() comes too late to prevent a false crash.
+        if self.tokenizer_manager._subprocess_watchdog is not None:
+            self.tokenizer_manager._subprocess_watchdog.stop()
         self.tokenizer_manager.gracefully_exit = True
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):
