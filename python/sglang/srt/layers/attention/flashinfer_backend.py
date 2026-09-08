@@ -323,7 +323,7 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner
         )
         self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
-        self.enable_mis = model_runner.server_args.enable_mis
+        self.enable_mis = get_exec().features.enable_mis
         self.device = model_runner.device
 
         # FIXME: remove dllm workarounds from flashinfer
