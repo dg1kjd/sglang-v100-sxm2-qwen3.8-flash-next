@@ -7,6 +7,65 @@ The fork tracks two upstreams. Check both.
 | `sgl-project/sglang` | the engine; moves ~70 commits/day |
 | `haohervchb/sglang-V100` | the Volta port this fork re-lands; last moved `72ef2f5f3`, 2026-09-01, and is fully contained here |
 
+## Measured: syncing 93 commits (2026-09-08)
+
+Third sync, `31d28a296` -> `ccfa120da`, one day of drift.
+
+| | |
+|---|---|
+| new upstream commits | 93 |
+| files upstream touched | 1,492 |
+| our surface against upstream | 230 |
+| raw file overlap | 23 |
+| **conflicts `git merge` produced** | **2** |
+| new import breakage (G1 sweep) | 1, characterised, unreachable on sm70 |
+| AOT kernel rebuild required | no (upstream touched only `csrc/cpu/`) |
+| dependency pin changes | none |
+| cold 131.5K+300, best of 3 | 37.16 s vs 37.39 s before the merge |
+
+Both conflicts came from one thing: the five-commit **`[Config]` Round 6.x
+stack** (#38046 -> #38113), which finished moving configuration off the
+`ServerArgs` record and into the runtime context's namespace bags.
+
+- `flashinfer_backend.py` — `server_args.enable_mis` became
+  `get_exec().features.enable_mis`. Keep both sides; ours added `self.device`.
+- `server_args.py` — every `*_CHOICES` list moved to a new
+  `arg_groups/choices.py` and the file shrank from ~4,460 lines to ~1,000. Take
+  upstream wholesale and re-register `tilelang_fa_v100`, `flash_attn_v100` and
+  the `tilelang` linear-attn backend in the new file. `server_args` re-exports
+  the lists, so out-of-tree importers are unaffected.
+
+### A sweep of upstream's own callers is the thing to scan for
+
+Round 6.4 converted sixty-odd files and dropped nine now-empty parameters at
+every call site. That is the same shape as the two failures the previous sync's
+static gates missed, and the reason is structural: **`merge-ort` only looks at
+files both sides changed**, so a tree-wide rename lands everywhere except our
+67 fork-only files, silently.
+
+Three scans generalise it. Each diffs the old pin against the new tip, then
+checks our surface — `git diff --name-only sglang_live` — for the leftovers:
+
+1. **Signature drift.** Parse every changed file at both refs, diff each
+   function's parameter set, then walk our call sites for a removed keyword.
+   *(20 functions lost a parameter; 0 of our call sites passed one.)*
+2. **Removed record fields.** Diff the `ServerArgs` declarations at both refs.
+   *(4 removed, all CP-v1 deprecation; 0 referenced here.)*
+3. **Attribute drift.** Collect every attribute our files access, subtract the
+   merged tree's whole name vocabulary, and keep what existed at the old pin.
+   This is the one that catches a rename like
+   `num_token_non_padded_cpu` -> `global_num_token_non_padded_cpu`. *(0.)*
+
+Scan 3 has a false-positive class worth knowing: Round 6.5 turned the parallel
+quotients (`attn_tp_size` and five siblings, `is_ep_joiner`,
+`is_startup_weight_load_overlap`, `enable_mamba_extra_buffer{,_lazy}`) from
+`def` properties into `Derived(...)` declarations. A scan that only recognises
+`def` and `class` reports them as deleted. They resolve through the bags
+unchanged.
+
+None of the three catches the *second* failure class from last sync — a
+predicate getting narrower, with nothing renamed or removed. Only step 7 does.
+
 ## Measured: syncing 214 commits (2026-09-07)
 
 Second sync since the re-land, `99b910955` -> `31d28a296`. This is the

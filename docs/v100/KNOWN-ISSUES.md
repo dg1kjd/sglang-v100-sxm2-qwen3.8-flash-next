@@ -86,11 +86,29 @@ Status: `[ ]` open, `[x]` done, `[~]` done in source but unverified at runtime.
 
 ## Upstream sync
 
-- [ ] **Next sync must handle upstream's tree-wide ruff-format first.**
-  `28262c20d` (#37210) reformats 1,411 files; merging it head-on re-conflicts
-  83 of the 167 files this re-land hand-resolved, for zero semantic gain. Run
-  the formatter on our side as its own commit, then merge. Full recommendation
-  and the list of substantive commits worth having: `docs/v100/UPSTREAM-SYNC.md`.
+- [x] ~~Next sync must handle upstream's tree-wide ruff-format first.~~
+  *(retired 2026-09-08 — the prediction was wrong twice over.)* `28262c20d`
+  (#37210) was merged head-on in the 214-commit sync and produced zero conflicts
+  among the 45 overlap files that existed only because of it; `merge-ort`
+  separates whole-file reformatting from our hunks on its own. It is now two
+  syncs behind us. `docs/v100/UPSTREAM-SYNC.md` carries the measured cost of a
+  sync and the failure modes that do matter.
+
+- [ ] **`hc_mix.py` imports a module upstream deleted.** `a71178547` (#38124)
+  drops the vendored dense BF16 GEMM in favour of FlashInfer 0.6.18, taking
+  `kernels/ops/gemm/flashinfer_pr4266_dense_bf16_gemm_sm100_splitk` with it.
+  Our fork-only `srt/layers/elementwise/hc_mix.py` imports `SplitKTactic`,
+  `default_tactic`, `validate_tactic`, `run_splitk_dense_gate` and
+  `run_splitk_dense_silu` from it, in two lazy function-level imports.
+  **Unreachable on this hardware**, so it is not a serving bug: the only caller
+  (`hyperconnection.py:273`) is gated on `_jit_mix_ok`, which requires
+  `torch.cuda.get_device_capability()[0] == 10` (Blackwell), and the sm70
+  branch above it claims the call on Volta regardless. It is also DeepSeek-V4
+  hyper-connection code, which `qwen4exp` never enters. Left in place rather
+  than deleted because removing fork code is a wider decision than a sync; the
+  options are to drop the file and its branch, or re-target it at FlashInfer
+  0.6.18. This is the one entry the G1 import sweep reports that pre-merge did
+  not.
 
 ## Documentation
 
