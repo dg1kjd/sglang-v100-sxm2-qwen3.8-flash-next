@@ -412,6 +412,19 @@ def fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    # Small-batch decode leaves most of the GPU idle: the grid is
+    # (cdiv(V, BV), N, HV) of one warp each, which for Qwen3.8-Flash-Next at
+    # TP4 (HV=12, V=128, N=1) is 48 CTAs on an 80-SM V100. V is a pure output
+    # dimension -- both state reductions reduce over K -- so narrowing BV
+    # spreads the same work over more CTAs at equal traffic, and is bitwise
+    # identical. One CTA of one warp cannot hide the state load, so the target
+    # is several resident per SM, not merely one. Measured on V100 at that
+    # shape, T=4: 48 CTAs 24.03 us, 96 13.19, 192 8.09, 384 9.07 -- so aim for
+    # <= 3 CTAs/SM and never split below BV=8.
+    if q.is_cuda:
+        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+        while BV > 8 and triton.cdiv(V, BV // 2) * N * HV <= 3 * num_sms:
+            BV //= 2
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
