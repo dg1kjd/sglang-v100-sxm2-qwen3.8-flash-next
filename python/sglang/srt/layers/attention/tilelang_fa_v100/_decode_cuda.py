@@ -160,6 +160,18 @@ def sm70_cuda_qsa_prefill(
     return output
 
 
+def _qsa_cache_view(cache: torch.Tensor) -> torch.Tensor:
+    """View the paged KV cache for the CUDA op.
+
+    The E5M2 pool is one byte per element and is read as uint8; an FP16 pool is
+    read as half. Reinterpreting an FP16 cache to bytes would double the
+    element count, so the view is dtype-dependent.
+    """
+    if cache.dtype == torch.float8_e5m2:
+        return cache.view(torch.uint8).contiguous()
+    return cache.contiguous()
+
+
 def sm70_cuda_qsa_decode(
     q,
     k_cache,
@@ -170,7 +182,7 @@ def sm70_cuda_qsa_decode(
     seq_lens,
     softmax_scale,
 ):
-    """Run QSA split-KV decode directly from selected E5M2 cache rows."""
+    """Run QSA split-KV decode directly from selected E5M2 or FP16 cache rows."""
     ext = _load_sm70_cuda_decode_ops()
     if ext is None:
         raise RuntimeError("SM70 CUDA QSA decode extension is unavailable.")
@@ -186,8 +198,8 @@ def sm70_cuda_qsa_decode(
     indices = indices.to(dtype=torch.int32).contiguous()
     ext.sm70_qsa_decode(
         q.contiguous(),
-        k_cache.view(torch.uint8).contiguous(),
-        v_cache.view(torch.uint8).contiguous(),
+        _qsa_cache_view(k_cache),
+        _qsa_cache_view(v_cache),
         req_to_token.to(dtype=torch.int32).contiguous(),
         req_indices.to(dtype=torch.int32).contiguous(),
         indices,
