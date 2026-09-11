@@ -87,11 +87,16 @@ args=(
   --dp-size "${FLASH_NEXT_DP:-1}"
   --host "${FLASH_NEXT_HOST:-127.0.0.1}"
   --port "${FLASH_NEXT_PORT:-30000}"
-  # 0.85 (NOT 0.90): the GDN linear-attention prefill kernel needs real prefill
-  # headroom; at 0.90 the KV pool ate it down to ~2.1G and small (~6k) prefills
-  # OOM'd in chunked_gdn_sm70. 0.85 keeps ~3G headroom. The "max KV" for
-  # multi-agent comes from the hierarchical host+disk tiers below, not the GPU.
-  --mem-fraction-static 0.85
+  # 0.88 (was 0.85): fp16 QSA KV is the decision of record (fast decode kernel).
+  # Moving e5m2 -> fp16 halved the pool (655680 -> 327840 tokens at 0.85); this
+  # re-claims some of that spare VRAM to grow it back. Bounded above by the GDN
+  # linear-attention prefill OOM wall -- at 0.90 the KV pool ate the transient
+  # headroom down to ~2.1G and ~6k prefills OOM'd in chunked_gdn_sm70 -- so 0.88
+  # keeps ~2.4G headroom, a safe margin under that wall. QSA's sparsity makes
+  # each extra pool token cheap to serve (decode attention is O(top-k), not
+  # O(context)), so this modest byte bump is a large, high-value token increase.
+  # The "max KV" for multi-agent still comes from the host+disk tiers below.
+  --mem-fraction-static "${FLASH_NEXT_MEM_FRACTION:-0.88}"
   --context-length 262144
   # 3, not 4: measured on this hardware, aggregate decode PEAKS at three
   # concurrent requests (116.7 tok/s) and falls at four (108.8) while TTFT
@@ -216,6 +221,14 @@ if [[ "$MODE" == mtp ]]; then
     --speculative-eagle-topk 1
     --speculative-num-draft-tokens 4
   )
+fi
+
+# Extra launch args appended at the end (space-separated); empty by default.
+# Production fp16 KV is set here: FLASH_NEXT_EXTRA_ARGS=--kv-cache-dtype auto
+# overrides the hardcoded --kv-cache-dtype fp8_e5m2 above (last-wins).
+if [[ -n "${FLASH_NEXT_EXTRA_ARGS:-}" ]]; then
+  read -r -a extra_args <<<"$FLASH_NEXT_EXTRA_ARGS"
+  args+=("${extra_args[@]}")
 fi
 
 cd "$REPO"
