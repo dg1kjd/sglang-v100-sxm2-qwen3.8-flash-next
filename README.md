@@ -2,6 +2,8 @@
 
 # SGLang&nbsp;V100
 
+*"Cool-kids-on-steroids"-Release ;)*
+
 **Qwen3.8-Flash-Next at full 262K context on 4× NVIDIA V100 SXM2.**
 
 A Volta (sm70) port of [SGLang](https://github.com/sgl-project/sglang).
@@ -37,12 +39,6 @@ different:
 |---|---|---|
 | Coding problems — 8× HumanEval, the 1Cat-vLLM comparison | **156.6** (median, 150–160) | 3.90 |
 | Agentic long context — 7,413-token prompt, one stream | **127** | ~3.3 |
-
-The coding-problem figure is at/above 1Cat-vLLM's 150 on the same checkpoint;
-the fp16 KV and the fixed draft-extend path deliver what they were meant to.
-The agentic figure is lower, not from a regression: a long, repetitive code
-context is harder for the draft model to predict (accept length drops) and the
-live context is far longer. Same kernel, same draft path.
 
 Agentic decode under concurrency — per-stream median over 194–289 requests in a
 ~1-hour sustained load:
@@ -236,6 +232,12 @@ about 4,250 commits later. Upstream's engine
 — including the unified radix cache, the hierarchical KV cache and the
 speculative decoding stack — is used as-is wherever possible; this fork adds the
 sm70 layer and the Qwen3.8-Flash-Next model support on top.
+
+This is not a pure 3-way merge between the two upstream repos. Beyond re-landing
+the port, the tree carries hand-crafted optimizations and bug fixes, and it is
+ruggedized, tested, and plug-and-play — it runs as shipped. It is also ongoing:
+we intend to keep pulling in upstream improvements as well as continuing our own
+work on top.
 
 Every deviation from upstream carries its reasoning in the commit that made it;
 `git log` is the record.
