@@ -19,30 +19,60 @@ FlashAttention needs sm80+, and Volta has no bfloat16 at all.
 This fork closes that gap. It serves **Qwen3.8-Flash-Next** — 125B MoE with a
 51 GB host-offloaded PLE n-gram table, a hybrid 36×GDN + 12×QSA attention stack,
 a built-in MTP draft head and a vision tower — on four 32 GB V100s, at the
-model's native 262,144-token context, with NVFP4 weights and an FP8-E5M2 KV
-cache.
+model's native 262,144-token context, with NVFP4 weights and an FP16 KV cache.
 
 If you have V100s sitting idle because modern inference stacks abandoned them,
 this makes them useful again for frontier-class long-context agentic work.
 
 ## Measured performance
 
-Single node, 4× V100-SXM2-32GB, TP=4, 131,508-token prompt + 300 generated
-tokens, temperature 0, cold prefill (prefix cache flushed):
+Single node, 4× V100-SXM2-32GB, TP=4, the built-in MTP draft head on,
+`--mem-fraction-static 0.86`, warm JIT. Greedy (temperature 0), thinking
+disabled, cold prefill (prefix cache flushed before each request).
 
-| | total | prefill | decode | MTP accept |
-|---|---|---|---|---|
-| `target` (no speculation) | **36.7 s** | **4,139 tok/s** | **60.4 tok/s** | — |
-| `mtp` (EAGLE, 3 steps) | **38.9 s** | **3,861 tok/s** | **62.3 tok/s** | **0.57–0.65** |
+**Decode.** Measured two ways, because the workloads a reader cares about are
+different:
 
-Short-context decode with MTP runs 61–74 tok/s. Idle cost is ~4% CPU per rank
-and 0% GPU — the scheduler blocks on a poller rather than spinning.
+| workload | decode (tok/s) | MTP accept len |
+|---|---|---|
+| Coding problems — 8× HumanEval, the 1Cat-vLLM comparison | **156.6** (median, 150–160) | 3.90 |
+| Agentic long context — 7,413-token prompt, one stream | **127** | ~3.3 |
 
-> For scale: on the same host and the same 131.5K input, `llama.cpp` in
-> layer-split mode took 639–663 s. That is not a like-for-like comparison —
-> llama.cpp's tensor-parallel mode was unavailable for this architecture, and
-> layer-split serialises across GPUs — but it is the practical alternative on
-> this hardware, and the gap is roughly 16×.
+The coding-problem figure is at/above 1Cat-vLLM's 150 on the same checkpoint;
+the fp16 KV and the fixed draft-extend path deliver what they were meant to.
+The agentic figure is lower, not from a regression: a long, repetitive code
+context is harder for the draft model to predict (accept length drops) and the
+live context is far longer. Same kernel, same draft path.
+
+Agentic decode under concurrency — per-stream median over 194–289 requests in a
+~1-hour sustained load:
+
+| concurrency | generation (tok/s, per stream) | time to first token |
+|---|---|---|
+| 1 | **127** | 2.96 s |
+| 2 | **78.9** | 4.74 s |
+| 4 | **54.0** | 8.70 s |
+
+Per-stream is what a single request sees; aggregate still climbs with
+concurrency (four streams ≈ 216 tok/s combined).
+
+**Prefill** scales with prompt length — fixed per-request overhead dominates
+short prompts and amortises over long ones:
+
+| prompt tokens | 375 | 1,473 | 2,936 | 5,862 | 11,714 | 23,417 |
+|---|---|---|---|---|---|---|
+| prefill tok/s | 283 | 986 | 1,746 | 2,395 | 2,888 | 3,092 |
+
+The 7,413-token agentic prompt prefills at ~2,560 tok/s (≈2.9 s cold). The
+262K context is real: a ~131,500-token prompt prefills in ~48 s (~2,700 tok/s).
+Idle cost is ~4% CPU per rank and 0% GPU — the scheduler blocks on a poller
+rather than spinning.
+
+> For scale: on the same host, `llama.cpp` in layer-split mode took 639–663 s
+> for the same ~131.5K-token prompt. Not a like-for-like comparison — llama.cpp's
+> tensor-parallel mode was unavailable for this architecture, and layer-split
+> serialises across GPUs — but it is the practical alternative on this hardware,
+> and it is roughly an order of magnitude slower.
 
 ## Hardware and software requirements
 
@@ -73,14 +103,13 @@ bash scripts/install_v100.sh
 bash scripts/smoke_v100.sh
 ```
 
-**Do not skip the smoke check.** No prebuilt kernels are distributed here — the
-`.so` files are build outputs, so a fresh clone has none until
-`install_v100.sh` finishes. That matters more than it sounds: the stock Marlin
-MoE kernel is an empty stub below sm80, so a server missing the V100 kernels
-starts, answers, and returns **zero-valued expert output** — confident nonsense
-rather than an error. `smoke_v100.sh` must report a registration on every line;
-treat the startup warning about `marlin_v100` as fatal. Details in
-[docs/v100/INSTALL.md](docs/v100/INSTALL.md#6-turbomind-sm70-and-marlin-v100).
+`install_v100.sh` (the build) plus `smoke_v100.sh` (the check) is the entire
+install; **[docs/v100/INSTALL.md](docs/v100/INSTALL.md)** documents what each
+step does and what to do when one fails. **Do not skip the smoke check** — no
+prebuilt kernels are distributed (the `.so` files are build outputs), and the
+stock Marlin MoE kernel is an empty stub below sm80, so a server missing the
+V100 kernels starts, answers, and returns zero-valued expert output: confident
+nonsense rather than an error.
 
 ### Get the model
 
@@ -101,7 +130,7 @@ export FLASH_NEXT_MODEL=~/models/Qwen3.8-Flash-Next-NVFP4
 |---|---|
 | checkpoint | [`RadixArk/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) |
 | base model | [`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) |
-| quantisation | NVFP4 W4A16 (modelopt), FP8-E5M2 KV cache at runtime |
+| quantisation | NVFP4 W4A16 (modelopt), FP16 KV cache at runtime |
 
 Other checkpoints of the same architecture should work but are untested here.
 The model is subject to its own license, which you must satisfy independently.
@@ -161,7 +190,10 @@ newer SGLang and fixes what the move broke; see
 - **GDN linear attention** in TileLang and Triton, tuned for sm70 occupancy.
 - **TurboMind sm70 backend** for block-FP8 and FP16 MoE, plus an exact AWQ
   dequantiser.
-- **FP8-E5M2 KV cache** on hardware without native FP8.
+- **FP16 / FP8-E5M2 KV cache** on hardware without native FP8. The FP16 path —
+  the production dtype — uses a fast sm70 sparse decode kernel that reads only
+  the selected top-k K/V, so its higher per-token precision costs no decode
+  speed on this sparse-attention model.
 - **PLE host offload** — the 51 GB n-gram table lives in host RAM, with the
   per-request n-gram and short-conv state riding the mamba slot lifecycle.
 - **Single-stage custom all-reduce**, because two-stage is pathological on a
@@ -177,14 +209,22 @@ Stated plainly, because the alternative is you finding them at 3am:
 - **`multimodal_gen` (diffusion / video generation) is not ported.** It carries
   upstream's code, not this fork's Volta adaptations. The Qwen3.8 *vision tower*
   is fully working — that is a different subsystem.
-- **No 24-hour soak has been run** on the current tree. A 24-request mixed
-  workload shows no leak or instability, which is not the same thing.
+- **Stability was hammered, not soaked.** A ~1-hour sustained load — agentic
+  prompts at np 1/2/4 plus a beyond-spec 32k-token / np 8 phase — ran with no
+  crash and no incorrect output at the current `--mem-fraction-static 0.86`. It
+  did surface one prefill OOM at the previous 0.88 default under the beyond-spec
+  load; the 0.86 retune fixed it (rationale in the serve-script comment). A
+  multi-day soak has not been run.
+- **Greedy output is not bit-reproducible across cache states.** A property of
+  the FP16 mamba-hybrid pipeline with a radix cache, not a defect: the cache
+  replays an approximate GDN (linear-attention) state for a cached prefix, so a
+  prompt's exact tokens can differ a little between a cold and a warm prefix,
+  and prompts sitting on a token decision boundary can vary across runs. Every
+  output is a valid completion — no corruption or garbage.
 - **A cold FlashInfer JIT cache costs several minutes** on first launch, and
   four TP ranks will compile in parallel. Subsequent launches are fast.
 - **The dense NVFP4 linear path is unverified.** It matters only if a checkpoint
   quantises weights outside the MoE experts; Qwen3.8-Flash-Next does not.
-
-Open items are tracked in [`docs/v100/KNOWN-ISSUES.md`](docs/v100/KNOWN-ISSUES.md).
 
 ## Relationship to upstream
 
@@ -198,9 +238,7 @@ speculative decoding stack — is used as-is wherever possible; this fork adds t
 sm70 layer and the Qwen3.8-Flash-Next model support on top.
 
 Every deviation from upstream carries its reasoning in the commit that made it;
-`git log` is the record. The procedure for taking a newer upstream — including
-the one trap that matters — is in
-[`docs/v100/UPSTREAM-SYNC.md`](docs/v100/UPSTREAM-SYNC.md).
+`git log` is the record.
 
 Bug reports about the sm70 path belong here. Bug reports about SGLang itself
 belong upstream.

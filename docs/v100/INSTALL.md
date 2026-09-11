@@ -229,6 +229,13 @@ SGLANG_V100_PYTHON=$(which python) bash scripts/smoke_v100.sh
 bash scripts/serve_qwen38_flash_next_nvfp4_v100.sh mtp
 ```
 
+`mtp` enables the built-in draft head (recommended); `target` runs without
+speculation. The launcher carries the tuned serving config — FP16 KV cache,
+`--mem-fraction-static 0.86`, the hierarchical host/disk cache, and the MTP
+draft head — with the *reasons* for each OOM-sensitive value in its comments.
+Read them before changing `--mem-fraction-static`, `--max-prefill-tokens`,
+`--hicache-size`, or the KV dtype.
+
 First launch compiles the sm70 JIT kernels; expect several minutes, and expect
 all four ranks to compile at once. Later launches reuse `~/.cache/sglang/jit/sm70`.
 
