@@ -381,6 +381,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_deepep_v2()
                         or get_moe_a2a_backend().is_flashinfer()
+                        or get_moe_a2a_backend().is_flashinfer_megamoe()
                     )
                     else {}
                 ),
@@ -539,10 +540,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     gate = self.shared_expert_gate(hidden_states)
                     shared_output = sigmoid_gate_mul_broadcast(shared_output, gate)
                 else:
-                    shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
-                        * shared_output
+                    from sglang.kernels.ops.gemm.sm70_qwen_fusions import (
+                        gate,
+                        gate_supported,
                     )
+
+                    if gate_supported(
+                        hidden_states,
+                        self.shared_expert_gate.weight,
+                        shared_output,
+                        self.shared_expert_gate.bias,
+                    ):
+                        shared_output = gate(
+                            hidden_states, self.shared_expert_gate.weight, shared_output
+                        )
+                    else:
+                        shared_output = (
+                            F.sigmoid(self.shared_expert_gate(hidden_states))
+                            * shared_output
+                        )
 
         return shared_output
 
@@ -701,9 +717,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return router_output, shared_output
 
         self.alt_stream.wait_stream(current_stream)
+        shared_input = (
+            hidden_states
+            if self.experts.quant_method.preserves_input
+            else hidden_states.clone()
+        )
         shared_output = (
             self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
+                shared_input, apply_gate=not use_fused_gate
             )
             if self.shared_expert is not None
             else None

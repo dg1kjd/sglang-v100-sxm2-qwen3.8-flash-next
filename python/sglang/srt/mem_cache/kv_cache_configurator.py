@@ -1127,9 +1127,7 @@ class KVCacheConfigurator:
                 ngram_context_len=self.mambaish_config.ngram_context_len,
                 ngram_eos_token_id=int(self.mambaish_config.eos_token_id),
             )
-
         req_to_token_pool = pool_cls(
-            **ple_kwargs,
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
@@ -1140,6 +1138,7 @@ class KVCacheConfigurator:
             mamba_layer_ids=self._get_mamba_layer_ids_for_req_pool(),
             enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
             enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+            **ple_kwargs,
             # A PD prefill server never runs TARGET_VERIFY, so skip the
             # verify-only per-draft-token state snapshots (see the draft-head
             # case above: None => the pool skips SpeculativeState).
@@ -1527,7 +1526,27 @@ class KVCacheConfigurator:
         from sglang.srt.hardware_backend.npu.memory_pool_npu import (
             NPUMLATokenToKVPool,
         )
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
+        is_arch35 = is_npu_arch35()
+        use_compact_indexer_layout = (
+            is_dsa_model
+            and is_arch35
+            and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
+        )
+        indexer_layer_ids = None
+        if use_compact_indexer_layout:
+            indexer_layer_ids = tuple(
+                layer_id
+                for layer_id in range(
+                    self.layer_info.start_layer,
+                    self.layer_info.end_layer,
+                )
+                if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+            )
+        use_dsa_fp8_kv_cache_storage = (
+            self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
+        )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1535,6 +1554,14 @@ class KVCacheConfigurator:
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
+            indexer_layer_ids=indexer_layer_ids,
+            kv_cache_dim=(
+                calculate_mla_kv_cache_dim(
+                    model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+                )
+                if use_dsa_fp8_kv_cache_storage
+                else None
+            ),
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
@@ -1813,9 +1840,13 @@ class KVCacheConfigurator:
     ) -> KVCache:
         from sglang.srt.layers.attention.qsa.config import (
             QSA_VARIANT_COMPRESSED,
+            QSA_VARIANT_TOKENWISE,
             parse_qsa_profile,
         )
-        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+            QwenDSATokenToKVPool,
+        )
 
         full_attention_layer_ids = (
             [0]
@@ -1907,6 +1938,14 @@ class KVCacheConfigurator:
                 # cache may be fp8, so this must not follow kv_cache_dtype.
                 index_state_dtype=self.model_config.dtype,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
+            )
+
+        if qsa_profile is not None and qsa_profile.variant == QSA_VARIANT_TOKENWISE:
+            return QwenDSATokenToKVPool(
+                **common_kwargs,
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_token_budget=qsa_profile.budget,
             )
 
         token_to_kv_pool = HybridLinearKVPool(
@@ -2266,6 +2305,13 @@ class KVCacheConfigurator:
         else:
             requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
+        if (
+            envs.SGLANG_DSV41_STICKY_LAST_SEQ.get()
+            and get_memory().disable_radix_cache
+        ):
+            # One extra req row so the idle pin and the next HTTP turn coexist
+            # until match_prefix reuses or drops the pin.
+            max_num_reqs += 1
 
         capped_by_mamba = False
         if self.mambaish_config is not None:
@@ -2565,8 +2611,8 @@ def calculate_mla_kv_cache_dim(
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
     if _is_hip and (
-        get_exec().kernel.dsa_prefill_backend in ("tilelang", "aiter")
-        or get_exec().kernel.dsa_decode_backend in ("tilelang", "aiter")
+        get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
+        or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter")
     ):
         return kv_cache_dim
 

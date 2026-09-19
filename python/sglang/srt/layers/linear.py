@@ -38,6 +38,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
     RowvLLMParameter,
     _ColumnvLLMParameter,
+    copy_with_check,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
@@ -81,6 +82,18 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+
+
+def _ue8m0_scale_block_n(param, raw_block_n: int) -> int:
+    """N-block size used when slicing a block-quant scale tensor.
+
+    ``format_ue8m0`` must not force ``block_n=1``. That was written for 1×32
+    MXFP8 (one scale row per output channel). Official DSV4.1-Flash dense is
+    32×32 UE8M0 with scales ``[N/32, K/32]``; using 1 overflows fused gate/up
+    shards (e.g. offset 288 into an 18-row TP8 scale).
+    """
+    del param  # layout follows weight_block_size, not the UE8M0 flag
+    return int(raw_block_n)
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):
@@ -292,7 +305,7 @@ class ReplicatedLinear(LinearBase):
         assert param.size() == loaded_weight.size(), (
             f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
         )
-        param.data.copy_(loaded_weight)
+        copy_with_check(param.data, loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
@@ -461,7 +474,7 @@ class ColumnParallelLinear(LinearBase):
         assert param_data.shape == loaded_weight.shape, (
             f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
         )
-        param_data.copy_(loaded_weight)
+        copy_with_check(param_data, loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not
@@ -645,7 +658,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     )
 
                 assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                copy_with_check(param_data, loaded_weight)
                 return
             current_shard_offset = 0
             shard_offsets: List[Tuple[int, int, int]] = []
@@ -778,7 +791,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 )
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_with_check(param_data, loaded_weight)
 
     def _load_fused_module_from_checkpoint(
         self,
@@ -836,7 +849,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         """
         weight_block_size = self.quant_method.quant_config.weight_block_size
         block_n, _ = weight_block_size[0], weight_block_size[1]
-        block_n = 1 if getattr(param, "format_ue8m0", False) else block_n
+        block_n = _ue8m0_scale_block_n(param, block_n)
 
         # Calculate block sizes for each shard
         shard_block_sizes = []
@@ -938,7 +951,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
-            block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
+            block_n = _ue8m0_scale_block_n(param, raw_block_n)
             shard_offset = (
                 (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
             ) // self.tp_size
@@ -1197,7 +1210,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
-            block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
+            block_n = _ue8m0_scale_block_n(param, raw_block_n)
             shard_offset = (shard_offset + block_n - 1) // block_n
             shard_size = (shard_size + block_n - 1) // block_n
 
@@ -1262,7 +1275,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                     )
 
                 assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                copy_with_check(param_data, loaded_weight)
                 return
             shard_offsets = [
                 # (shard_id, shard_offset, shard_size)
@@ -1430,7 +1443,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert param_data.shape == loaded_weight.shape, (
             f"{param_data.shape=} {loaded_weight.shape=}"
         )
-        param_data.copy_(loaded_weight)
+        copy_with_check(param_data, loaded_weight)
 
 
 class RowParallelLinear(LinearBase):
@@ -1590,7 +1603,7 @@ class RowParallelLinear(LinearBase):
         assert param_data.shape == loaded_weight.shape, (
             f"{param_data.shape=} {loaded_weight.shape=}"
         )
-        param_data.copy_(loaded_weight)
+        copy_with_check(param_data, loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
 
@@ -1794,7 +1807,7 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
             start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
-        param_data.copy_(loaded_weight)
+        copy_with_check(param_data, loaded_weight)
 
 
 class ColumnParallelBatchedLinear(nn.Module):

@@ -61,6 +61,10 @@ export SGLANG_CUSTOM_ALLREDUCE_ALGO=1stage
 export SGLANG_MAMBA_CONV_DTYPE=float16
 export SGLANG_MAMBA_SSM_DTYPE=float16
 export SGLANG_SM70_FORCE_FP16=1
+# Measured batch-one Volta projections and Qwen fusions. Set either to 0
+# before launch to select the previous implementation for comparisons.
+export SGLANG_SM70_DENSE_GEMV=1
+export SGLANG_SM70_QWEN_FUSIONS=1
 export SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS=8192
 export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
 export SGLANG_NUMA_BIND_V2=0
@@ -223,6 +227,10 @@ args=(
   # read. Deliberately NOT adding --enable-metrics-for-all-schedulers: per-rank
   # instrumentation adds per-step overhead and we run DP1 (one replica).
   --enable-metrics
+  # Explicit on V100 (fp16): the 51 GB PLE n-gram table must sit in host
+  # memory. Without offload it is created on GPU and OOMs at ~31.5 GiB/rank
+  # during create_weights.
+  --ple-offload-embedding
 )
 if [[ "$MODE" == mtp ]]; then
   # Built-in MTP-3/4 loads the MTP module from the same checkpoint.

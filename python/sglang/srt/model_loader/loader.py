@@ -1063,16 +1063,37 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
+        moe_first = []
+        pending_expand = []
+        others = []
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+            if quant_method is None:
+                continue
+            # Fused MoE repack first (same-sized rewrite). Linear methods that
+            # dequant to a wider dtype run after, so repack still has a hole.
+            if getattr(module, "w13_weight", None) is not None and hasattr(
+                module, "num_local_experts"
+            ):
+                moe_first.append((module, quant_method))
+                continue
+            expands = getattr(quant_method, "expands_storage_after_loading", None)
+            if callable(expands) and expands(module):
+                pending_expand.append((module, quant_method))
+                continue
+            others.append((module, quant_method))
+        for module, quant_method in (*moe_first, *others, *pending_expand):
+            # When quant methods need to process weights after loading
+            # (for repacking, quantizing, etc), they expect parameters
+            # to be on the global target device. This scope is for the
+            # case where cpu offloading is used, where we will move the
+            # parameters onto device for processing and back off after.
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
+
+        finalize = getattr(model, "finalize_after_quant_processing", None)
+        if callable(finalize):
+            finalize()
 
 
 class LayeredModelLoader(DefaultModelLoader):

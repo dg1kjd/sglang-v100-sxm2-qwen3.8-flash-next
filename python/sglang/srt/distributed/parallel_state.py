@@ -31,7 +31,7 @@ import os
 import pickle
 import weakref
 from collections import namedtuple
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
@@ -543,6 +543,20 @@ class GroupCoordinator:
                 self.cpu_group, 1 << 22, 6
             )
 
+        self.dsv41_hier_ar = None
+        if (
+            group_name == "tp"
+            and self.world_size == 8
+            and envs.SGLANG_DSV41_HIER_AR.get()
+        ):
+            from sglang.srt.distributed.device_communicators.dsv41_hier_ar import (
+                Dsv41HierAllReduce,
+            )
+
+            self.dsv41_hier_ar = Dsv41HierAllReduce(
+                self.ranks, self.rank, self.device
+            )
+
     def __repr__(self):
         return (
             f"ranks={self.ranks} rank={self.rank} local_rank={self.local_rank} use_pynccl={self.use_pynccl} "
@@ -599,7 +613,6 @@ class GroupCoordinator:
         # We don't need the context of custom quick allreduce because the ipc access
         # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
-        maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -607,7 +620,16 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with self.device_module.stream(stream), maybe_ca_context:
+        with ExitStack() as stack:
+            stack.enter_context(self.device_module.stream(stream))
+            if ca_comm is not None:
+                stack.enter_context(ca_comm.capture())
+            # WO-14: hier CA copies through the pre-registered staging buffer
+            # (never graph-pool pointers). capture() then IPCs those
+            # cudaMalloc buffers. Skipping it left rank_data slots empty.
+            hier = getattr(self, "dsv41_hier_ar", None)
+            if hier is not None:
+                stack.enter_context(hier.graph_capture_contexts())
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
@@ -667,6 +689,10 @@ class GroupCoordinator:
         """
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
+            return input_
+
+        hier = getattr(self, "dsv41_hier_ar", None)
+        if hier is not None and hier.reduce_inplace(input_):
             return input_
 
         if input_.is_cpu:
@@ -1016,6 +1042,9 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
+        hier = getattr(self, "dsv41_hier_ar", None)
+        if hier is not None and hier.reduce_inplace(input_):
+            return
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -1146,6 +1175,10 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        # 2-step quad/pair A2A on the V100 hybrid mesh (same split as hier AR).
+        hier = getattr(self, "dsv41_hier_ar", None)
+        if hier is not None and hier.all_to_all_single(output, input):
+            return
         # pynccl path keeps the a2a exchange CUDA-graph-capturable (DCP a2a backend).
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -1810,6 +1843,161 @@ class GroupCoordinator:
             else:
                 tensor_dict[key] = value
         return tensor_dict
+
+    def send_recv_tensor_dict(
+        self,
+        send_tensor_dict: Dict[str, Union[torch.Tensor, Any]],
+        send_dst: Optional[int] = None,
+        recv_src: Optional[int] = None,
+        send_all_gather_group: Optional["GroupCoordinator"] = None,
+        recv_all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+        """Send tensor dict to *send_dst* and simultaneously recv from *recv_src*.
+
+        Uses ``batch_isend_irecv`` to submit all send/recv operations
+        atomically, avoiding deadlock on backends (e.g. NPU/HCCL) where
+        ``isend`` may block until a matching ``recv`` is posted.
+
+        NOTE: ``send_dst`` / ``recv_src`` are local ranks within this group.
+        """
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return None
+
+        if send_dst is None:
+            send_dst = (self.rank_in_group + 1) % self.world_size
+        if recv_src is None:
+            recv_src = (self.rank_in_group - 1) % self.world_size
+
+        assert send_dst < self.world_size, f"Invalid send_dst rank ({send_dst})"
+        assert recv_src < self.world_size, f"Invalid recv_src rank ({recv_src})"
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+
+        # ---- 1. Exchange metadata via batch_isend_irecv on CPU group ----
+        send_metadata_list, send_tensor_list = _split_tensor_dict(send_tensor_dict)
+
+        send_meta_bytes = pickle.dumps(send_metadata_list)
+        send_meta_size = torch.tensor([len(send_meta_bytes)], dtype=torch.long)
+        send_meta_data = torch.frombuffer(send_meta_bytes, dtype=torch.uint8)
+
+        recv_meta_size = torch.empty(1, dtype=torch.long)
+
+        meta_ops = [
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                send_meta_size,
+                self.ranks[send_dst],
+                group=metadata_group,
+            ),
+            torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_meta_size,
+                self.ranks[recv_src],
+                group=metadata_group,
+            ),
+        ]
+        reqs = torch.distributed.batch_isend_irecv(meta_ops)
+        for req in reqs:
+            req.wait()
+
+        recv_meta_len = recv_meta_size.item()
+        recv_meta_data = torch.empty(recv_meta_len, dtype=torch.uint8)
+
+        meta_ops = [
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                send_meta_data,
+                self.ranks[send_dst],
+                group=metadata_group,
+            ),
+            torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_meta_data,
+                self.ranks[recv_src],
+                group=metadata_group,
+            ),
+        ]
+        reqs = torch.distributed.batch_isend_irecv(meta_ops)
+        for req in reqs:
+            req.wait()
+
+        recv_metadata_list = pickle.loads(recv_meta_data.numpy())
+
+        # ---- 2. Prepare recv buffers and collect all tensor ops ----
+        recv_tensor_dict: Dict[str, Any] = {}
+        tensor_ops: List[torch.distributed.P2POp] = []
+        recv_tensor_info: List[
+            Tuple[str, torch.Tensor, bool, Optional[torch.Size]]
+        ] = []
+
+        for key, value in recv_metadata_list:
+            if isinstance(value, TensorMetadata):
+                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                if tensor.numel() == 0:
+                    recv_tensor_dict[key] = tensor
+                    continue
+
+                use_all_gather = (
+                    recv_all_gather_group is not None
+                    and tensor.numel() % recv_all_gather_group.world_size == 0
+                )
+                orig_shape = None
+                if use_all_gather:
+                    orig_shape = tensor.shape
+                    tensor = tensor.reshape(recv_all_gather_group.world_size, -1)[
+                        recv_all_gather_group.rank_in_group
+                    ]
+
+                comm_group = metadata_group if tensor.is_cpu else group
+                tensor_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        tensor,
+                        self.ranks[recv_src],
+                        group=comm_group,
+                    )
+                )
+                recv_tensor_info.append((key, tensor, use_all_gather, orig_shape))
+            else:
+                recv_tensor_dict[key] = value
+
+        # Add send ops
+        for tensor in send_tensor_list:
+            if tensor.numel() == 0:
+                continue
+            send_t = tensor
+            if (
+                send_all_gather_group is not None
+                and send_t.numel() % send_all_gather_group.world_size == 0
+            ):
+                send_t = send_t.reshape(send_all_gather_group.world_size, -1)[
+                    send_all_gather_group.rank_in_group
+                ]
+            comm_group = metadata_group if send_t.is_cpu else group
+            tensor_ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    send_t,
+                    self.ranks[send_dst],
+                    group=comm_group,
+                )
+            )
+
+        # ---- 3. Batch exchange all tensors ----
+        if tensor_ops:
+            reqs = torch.distributed.batch_isend_irecv(tensor_ops)
+            for req in reqs:
+                req.wait()
+
+        # ---- 4. Post-process received tensors (all_gather if needed) ----
+        for key, tensor, use_all_gather, orig_shape in recv_tensor_info:
+            if use_all_gather:
+                tensor = recv_all_gather_group.all_gather(tensor, dim=0)
+                tensor = tensor.reshape(orig_shape)
+            recv_tensor_dict[key] = tensor
+
+        return recv_tensor_dict
 
     def barrier(self):
         """Barrier synchronization among the group.

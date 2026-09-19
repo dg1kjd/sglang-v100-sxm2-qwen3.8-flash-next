@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -421,7 +422,7 @@ def fused_sigmoid_gating_delta_rule_update(
     # is several resident per SM, not merely one. Measured on V100 at that
     # shape, T=4: 48 CTAs 24.03 us, 96 13.19, 192 8.09, 384 9.07 -- so aim for
     # <= 3 CTAs/SM and never split below BV=8.
-    if q.is_cuda:
+    if envs.SGLANG_SM70_MTP_GDN.get() and q.is_cuda:
         num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
         while BV > 8 and triton.cdiv(V, BV // 2) * N * HV <= 3 * num_sms:
             BV //= 2

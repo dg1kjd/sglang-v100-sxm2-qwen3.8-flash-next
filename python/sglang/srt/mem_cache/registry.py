@@ -274,14 +274,27 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         cache = StreamingSession(cache)
         streaming_wrapped = True
 
+    sticky_wrapped = False
+    if (
+        envs.SGLANG_DSV41_STICKY_LAST_SEQ.get()
+        and not get_serving().enable_streaming_session
+        and cache.is_chunk_cache()
+        and not cache.supports_streaming_session()
+    ):
+        from sglang.srt.mem_cache.sticky_last_sequence import StickyLastSequenceCache
+
+        cache = StickyLastSequenceCache(cache)
+        sticky_wrapped = True
+
     logger.info(
         "Tree cache initialized: source=%s impl=%s hybrid_swa=%s hybrid_ssm=%s "
-        "hicache_attached=%s streaming_wrapped=%s",
+        "hicache_attached=%s streaming_wrapped=%s sticky_wrapped=%s",
         source,
         type(cache).__name__,
         ctx.is_hybrid_swa,
         ctx.is_hybrid_ssm,
         hicache_attached,
         streaming_wrapped,
+        sticky_wrapped,
     )
     return cache

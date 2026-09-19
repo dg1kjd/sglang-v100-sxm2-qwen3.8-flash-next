@@ -241,10 +241,18 @@ def fused_marlin_moe(
         assert w1_global_scale.dtype == torch.float32
         assert w2_global_scale.dtype == torch.float32
     if is_mxfp4_marlin:
-        assert hidden_states.dtype == torch.bfloat16, (
-            "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 "
-            f"activations, got {hidden_states.dtype}"
-        )
+        if hidden_states.dtype == torch.float16:
+            sm_major = torch.cuda.get_device_capability(hidden_states.device)[0]
+            assert sm_major == 7, (
+                "MXFP4 Marlin FP16+E8M0 is the SM70 marlin_v100 path; "
+                f"got SM{sm_major}0 with dtype {hidden_states.dtype}"
+            )
+        else:
+            assert hidden_states.dtype == torch.bfloat16, (
+                "MXFP4 Marlin with E8M0 scales is instantiated for bfloat16 "
+                "on Hopper/Blackwell and float16 on SM70 marlin_v100, "
+                f"got {hidden_states.dtype}"
+            )
     elif not is_nvfp4_marlin:
         assert hidden_states.dtype == w1_scale.dtype, (
             f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
@@ -480,7 +488,10 @@ def fused_marlin_moe(
 
             moe_topk_sum(intermediate_cache3, output)
         else:
-            moe_sum_reduce(intermediate_cache3, output, 1.0)
+            if _has_sgl_moe_sum_reduce:
+                moe_sum_reduce(intermediate_cache3, output, 1.0)
+            else:
+                moe_sum_reduce_triton(intermediate_cache3, output, 1.0)
         return output
     else:
         if routed_scaling_factor is None:

@@ -74,6 +74,7 @@ def get_rope_index(
         model_type.startswith("qwen3_vl")
         or model_type.startswith("qwen3_vl_moe")
         or model_type.startswith("qwen3_5")
+        or model_type == "qwen4_exp"
         or model_type.startswith("interns2_mobius")
         or model_type == "qwen4_exp"
         or model_type.startswith("cosmos3_omni")

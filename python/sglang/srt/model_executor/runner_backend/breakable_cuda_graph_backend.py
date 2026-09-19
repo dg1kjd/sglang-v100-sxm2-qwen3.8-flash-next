@@ -18,6 +18,8 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -26,6 +28,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -54,6 +57,60 @@ if TYPE_CHECKING:
         BaseCudaGraphRunner,
     )
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
+
+logger = logging.getLogger(__name__)
+
+
+def _eager_clone_tensor(t: Any) -> Any:
+    if not torch.is_tensor(t) or t.numel() == 0:
+        return t
+    out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    out.copy_(t)
+    return out
+
+
+def _eager_clone_lpo(output: LogitsProcessorOutput) -> LogitsProcessorOutput:
+    kwargs = {}
+    for field in dataclasses.fields(output):
+        val = getattr(output, field.name)
+        kwargs[field.name] = _eager_clone_tensor(val) if torch.is_tensor(val) else val
+    return LogitsProcessorOutput(**kwargs)
+
+
+def select_bcg_replay_output(live: Any, stored: Any) -> Any:
+    """Pick the model return after a segmented replay.
+
+    ``BreakableCUDAGraph.replay`` returns the last eager-break value. Target
+    decode's last break is the logits processor (an LPO). DSpark draft's last
+    break is CSA2/HC (a Tensor) while the captured return is an LPO of
+    ``hidden_states``. Prefer a live LPO, else the stored LPO.
+    """
+    if isinstance(live, LogitsProcessorOutput):
+        return live
+    if isinstance(stored, LogitsProcessorOutput):
+        return stored
+    return live if live is not None else stored
+
+
+def _dsv41_log_logits(tag: str, out: Any) -> None:
+    lg = getattr(out, "next_token_logits", None)
+    gt = getattr(out, "greedy_token_ids", None)
+    hs = getattr(out, "hidden_states", None)
+    lg_fin = None
+    peek = None
+    if torch.is_tensor(lg) and lg.numel():
+        lg_fin = int(torch.isfinite(lg).sum().item())
+        peek = float(lg.reshape(-1)[0].item())
+    logger.info(
+        "DSV41 BCG %s logits=%s greedy=%s hs=%s finite=%s/%s peek=%s",
+        tag,
+        None if lg is None else tuple(lg.shape),
+        None if gt is None else tuple(gt.shape),
+        None if not torch.is_tensor(hs) else tuple(hs.shape),
+        lg_fin,
+        None if not torch.is_tensor(lg) else lg.numel(),
+        peek,
+    )
 
 
 class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
@@ -142,14 +199,28 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         ):
             self._precarve.mint()
             out = captured_fn()
-            out_rows = self._output_rows(out, size)
-            self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+        # Do not capture the output-buffer copy. Eager breaks already write
+        # into ``out`` (logits LPO); a captured copy was the last graph
+        # segment and hid IndexKernel OOBs until after replay() returned.
+        if post_warmup_hook is not None:
+            post_warmup_hook()
+
         self._graphs[shape_key] = graph
-        self._outputs[shape_key] = stored
+        self._outputs[shape_key] = out
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
+
+    @staticmethod
+    def _map_logits_tensors(
+        output: LogitsProcessorOutput, fn: Callable[[torch.Tensor], Any]
+    ) -> LogitsProcessorOutput:
+        """Resize or slice tensor fields; leave Python-side logprob lists as-is."""
+        kwargs = {}
+        for field in dataclasses.fields(output):
+            val = getattr(output, field.name)
+            kwargs[field.name] = fn(val) if torch.is_tensor(val) else val
+        return LogitsProcessorOutput(**kwargs)
 
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.
@@ -159,6 +230,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         """
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
+        if isinstance(output, LogitsProcessorOutput):
+            logits = output.next_token_logits
+            if logits is None:
+                return cap
+            return min(cap, logits.shape[0])
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
             return min([cap, *rows])
@@ -172,6 +248,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return None
         if torch.is_tensor(output):
             return output.new_empty((size, *output.shape[1:]))
+        if isinstance(output, LogitsProcessorOutput):
+            return self._map_logits_tensors(
+                output, lambda t: self._alloc_full_buffer(t, size)
+            )
         if isinstance(output, PPProxyTensors):
             return PPProxyTensors(
                 {
@@ -190,6 +270,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return None
         if torch.is_tensor(output):
             return output[:num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            return self._map_logits_tensors(
+                output, lambda t: self._slice_output(t, num_tokens)
+            )
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
         if isinstance(output, tuple):
@@ -210,6 +294,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             )
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
             output_buffer[:num_tokens].copy_(output[:num_tokens])
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            for field in dataclasses.fields(output):
+                src = getattr(output, field.name)
+                if not torch.is_tensor(src):
+                    continue
+                self._copy_output_to_buffer(
+                    src, getattr(output_buffer, field.name), num_tokens
+                )
             return
         if isinstance(output, PPProxyTensors) and isinstance(
             output_buffer, PPProxyTensors
@@ -254,9 +349,31 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        from sglang.srt.environ import envs
+
+        sync = envs.SGLANG_DSV41_PREFILL_SYNC.get()
         with graph_pool_replay_scope():
-            self._graphs[shape_key].replay()
-        return self._outputs[shape_key]
+            live = self._graphs[shape_key].replay()
+            stored = self._outputs[shape_key]
+            src = select_bcg_replay_output(live, stored)
+            if sync:
+                _dsv41_log_logits("inside pool", src)
+            if isinstance(src, LogitsProcessorOutput):
+                out = _eager_clone_lpo(src)
+            elif torch.is_tensor(src):
+                out = _eager_clone_tensor(src)
+            else:
+                out = src
+        if sync:
+            logger.info("DSV41 BCG backend after pool scope")
+            torch.cuda.synchronize()
+            idx = torch.zeros(1, device="cuda", dtype=torch.int64)
+            torch.zeros(1, device="cuda")[idx]
+            torch.cuda.synchronize()
+            logger.info("DSV41 BCG backend after pool scope ok")
+            _dsv41_log_logits("cloned", out)
+            logger.info("DSV41 BCG out inspect ok")
+        return out
 
     def cleanup(self) -> None:
         self.close()

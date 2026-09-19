@@ -272,9 +272,7 @@ endif()
 # sm70 (V100) compatible sources — these do not use bf16 intrinsics that require sm80+
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
-    "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
-    "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/concat_mla.cu"
@@ -288,7 +286,6 @@ set(SOURCES
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_group_quant_8bit_v2.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
-    "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
     "csrc/infllm_v2/max_pooling.cu"

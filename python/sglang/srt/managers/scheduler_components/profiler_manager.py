@@ -21,7 +21,6 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileR
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
@@ -73,8 +72,11 @@ class SchedulerProfilerManager:
 
         self.profiler_prefill_ct: Optional[int] = None
         self.profiler_decode_ct: Optional[int] = None
+        self.profiler_verify_ct: Optional[int] = None
         self.profiler_target_prefill_ct: Optional[int] = None
         self.profiler_target_decode_ct: Optional[int] = None
+        self.profiler_target_verify_ct: Optional[int] = None
+        self.profile_stages: Optional[List[str]] = None
 
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
@@ -124,6 +126,7 @@ class SchedulerProfilerManager:
 
         self.profile_by_stage = profile_by_stage
         self.merge_profiles = merge_profiles
+        self.profile_stages = [s.lower() for s in (profile_stages or [])]
 
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
@@ -141,12 +144,28 @@ class SchedulerProfilerManager:
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
 
+        self.profiler_prefill_ct = None
+        self.profiler_decode_ct = None
+        self.profiler_verify_ct = None
+        self.profiler_target_prefill_ct = None
+        self.profiler_target_decode_ct = None
+        self.profiler_target_verify_ct = None
+
         if num_steps:
             if self.profile_by_stage:
-                self.profiler_prefill_ct = 0
-                self.profiler_decode_ct = 0
-                self.profiler_target_prefill_ct = num_steps
-                self.profiler_target_decode_ct = num_steps
+                stages = set(self.profile_stages) if self.profile_stages else {
+                    "prefill",
+                    "decode",
+                }
+                if "prefill" in stages:
+                    self.profiler_prefill_ct = 0
+                    self.profiler_target_prefill_ct = num_steps
+                if "decode" in stages:
+                    self.profiler_decode_ct = 0
+                    self.profiler_target_decode_ct = num_steps
+                if "verify" in stages:
+                    self.profiler_verify_ct = 0
+                    self.profiler_target_verify_ct = num_steps
             elif start_step:
                 self.profiler_target_forward_ct = (
                     self.profiler_start_forward_ct + num_steps
@@ -271,8 +290,9 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            if self.ps.gpu_id == get_device().base_gpu_id:
-                torch.cuda.cudart().cudaProfilerStart()
+            torch.distributed.barrier(self.dp_tp_cpu_group)
+            torch.cuda.cudart().cudaProfilerStart()
+            torch.distributed.barrier(self.dp_tp_cpu_group)
             self.profile_in_progress = True
 
         self._apply_detailed_annotations(self.detailed_annotations)
@@ -384,8 +404,9 @@ class SchedulerProfilerManager:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.ps.gpu_id == get_device().base_gpu_id:
-                torch.cuda.cudart().cudaProfilerStop()
+            torch.distributed.barrier(self.dp_tp_cpu_group)
+            torch.cuda.cudart().cudaProfilerStop()
+            torch.distributed.barrier(self.dp_tp_cpu_group)
 
         merge_message = self._merge_profile_traces()
 
@@ -411,14 +432,31 @@ class SchedulerProfilerManager:
             return
 
         if self.profile_by_stage:
-            if batch.forward_mode.is_prefill():
+            mode = batch.forward_mode
+            # TARGET_VERIFY is also is_prefill(); handle it first so a verify-only
+            # capture does not mix EXTEND, and so draft DECODE in between verifies
+            # does not stop cudaProfiler.
+            if mode.is_target_verify():
+                if self.profiler_verify_ct is None:
+                    return
+                if self.profiler_verify_ct == 0:
+                    self._start_profile(mode)
+                self.profiler_verify_ct += 1
+                if self.profiler_verify_ct > self.profiler_target_verify_ct:
+                    if self.profile_in_progress:
+                        self._stop_profile(stage=mode)
+            elif mode.is_prefill():
+                if self.profiler_prefill_ct is None:
+                    return
                 if self.profiler_prefill_ct == 0:
-                    self._start_profile(batch.forward_mode)
+                    self._start_profile(mode)
                 self.profiler_prefill_ct += 1
                 if self.profiler_prefill_ct > self.profiler_target_prefill_ct:
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.EXTEND)
-            elif batch.forward_mode.is_decode():
+            elif mode.is_decode():
+                if self.profiler_decode_ct is None:
+                    return
                 if self.profiler_decode_ct == 0:
                     if self.profile_in_progress:
                         # force trace flush (a prefill capture must not absorb decode steps)
@@ -427,15 +465,15 @@ class SchedulerProfilerManager:
                     if min_bs > 0 and batch.batch_size() < min_bs:
                         # Wait for full admission before capturing the decode stage
                         return
-                    self._start_profile(batch.forward_mode)
+                    self._start_profile(mode)
                 self.profiler_decode_ct += 1
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.DECODE)
-            elif batch.forward_mode.is_idle():
+            elif mode.is_idle():
                 pass
             else:
-                raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
+                raise RuntimeError(f"unsupported profile stage: {mode}")
         else:
             # Check profiler
             if (

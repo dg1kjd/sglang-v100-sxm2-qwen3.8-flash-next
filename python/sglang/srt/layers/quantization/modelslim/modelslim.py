@@ -164,7 +164,13 @@ class ModelSlimConfig(QuantizationConfig):
             if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
                 continue
             if rest.startswith("markov_head."):
-                alias = f"markov_head.{rest[len('markov_head.') :]}"
+                suffix = rest[len("markov_head.") :]
+                if suffix in ("embed.weight", "embed_tokens.weight"):
+                    alias = "markov_head.markov_w1.weight"
+                elif suffix in ("head.weight", "lm_head.weight"):
+                    alias = "markov_head.markov_w2.weight"
+                else:
+                    alias = f"markov_head.{suffix}"
             elif rest.startswith("confidence_head."):
                 alias = f"confidence_head.{rest[len('confidence_head.') :]}"
             else:
@@ -186,9 +192,14 @@ class ModelSlimConfig(QuantizationConfig):
                 mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
                 mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
                 mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
-                mapped_rest = mapped_rest.replace(
-                    ".gate.bias", ".gate.e_score_correction_bias"
-                )
+                # Exact `.gate.bias` only; `.gate.bias_vl` is VL and skipped.
+                if mapped_rest.endswith(".gate.bias_vl"):
+                    continue
+                if mapped_rest.endswith(".gate.bias"):
+                    mapped_rest = (
+                        mapped_rest[: -len(".gate.bias")]
+                        + ".gate.e_score_correction_bias"
+                    )
                 alias = f"stages.{stage_id}.{mapped_rest}"
 
             dspark_quant_aliases[alias] = scheme

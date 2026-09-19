@@ -15,10 +15,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
+from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.common import is_gfx1250_supported, is_sm70_supported
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +366,21 @@ def hc_split_sinkhorn(
         # TileLang's CK-backed addressing doesn't compile on gfx1250; use the
         # Triton port. _hc_split_sinkhorn_torch is kept as a reference fallback.
         return _hc_split_sinkhorn_triton(
+            mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+        )
+    if is_sm70_supported():
+        # Volta cannot compile TileLang MHC. DSV4.1-shaped mixes use the SM70
+        # JIT (same 4-wide reduction order as _hc_split_sinkhorn_torch);
+        # other shapes keep the torch golden so TileLang is never pulled.
+        if hc_mult == 4 and mixes.shape[-1] == 24:
+            from sglang.kernels.ops.elementwise.sm70_dsv41_hc_mix import (
+                split_sinkhorn as _sm70_dsv41_split_sinkhorn,
+            )
+
+            return _sm70_dsv41_split_sinkhorn(
+                mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+            )
+        return _hc_split_sinkhorn_torch(
             mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
         )
     b, s, _ = mixes.size()
@@ -1240,7 +1255,7 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    if is_dsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_interleave():
         x = strict_contiguous(x)
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)

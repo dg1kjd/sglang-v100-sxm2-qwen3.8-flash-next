@@ -46,6 +46,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -55,10 +56,12 @@ from sglang.srt.utils.common import (
     ceil_div,
     is_float4_e2m1fn_x2,
     is_hip,
+    is_npu,
     spec_decode_alloc_len_per_request,
 )
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 
 @dataclass
@@ -310,6 +313,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         dcp_size = get_parallel().attn_dcp_size
 
         if kvc.use_mla_backend:
+            if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+                # NPU sparse KV offload uses an index-only device pool.
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                    get_sparsity_driven_kv_offload_cell_size,
+                )
+
+                offload_cell_size = get_sparsity_driven_kv_offload_cell_size(
+                    model_config=model_config,
+                    use_mla_backend=kvc.use_mla_backend,
+                    num_layers=num_layers,
+                    element_size=kv_size,
+                )
+                if offload_cell_size is not None:
+                    return offload_cell_size
+
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
             )
@@ -406,7 +424,39 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     n * (model_config.head_dim + model_config.v_head_dim) * num_layers
                 ) // scale_block_size
 
+        cell_size += self._compute_qsa_cell_size(
+            hf_config=model_config.hf_config, num_layers=num_layers
+        )
         return cell_size
+
+    @staticmethod
+    def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
+        from sglang.srt.layers.attention.qsa.config import (
+            QSA_VARIANT_COMPRESSED,
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+            QwenDSATokenToKVPool,
+        )
+
+        if num_layers == 0:
+            return 0
+        qsa_profile = parse_qsa_profile(hf_config)
+        if qsa_profile is None:
+            return 0
+        if qsa_profile.variant == QSA_VARIANT_COMPRESSED:
+            return QSATokenToKVPool.qsa_bytes_per_token(
+                kv_heads=qsa_profile.kv_heads,
+                head_dim=qsa_profile.head_dim,
+                compress_ratio=qsa_profile.compress_ratio,
+                num_layers=num_layers,
+            )
+        return QwenDSATokenToKVPool.qsa_bytes_per_token(
+            kv_heads=qsa_profile.kv_heads,
+            head_dim=qsa_profile.head_dim,
+            num_layers=num_layers,
+        )
 
     def _compute_dsa_indexer_cell_size(
         self,
@@ -422,6 +472,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            dtype = kvc.kv_cache_dtype
+            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
+            if dtype != torch.float8_e4m3fn:
+                indexer_size_per_token = index_head_dim
+                element_size = torch._utils._element_size(dtype)
+            if not is_npu_arch35():
+                allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
@@ -482,6 +542,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes = max(available_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
@@ -939,6 +1000,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
 
         self._unified = is_unified_kv_triton()
+        # SM70 V4.1 attention writes SWA into CSA2 rings, not the paged SWA
+        # pool. Charging swa_ratio·layers here is what pinned DSpark to ~135k
+        # tokens on 32 GiB (2394 B/tok). Skip that charge; keep a fixed SWA
+        # floor big enough for chunked prefill (hybrid allocator is still 1:1
+        # with the chunk) plus sticky + running window locks.
+        self._sm70_csa2_skip_paged_swa = bool(get_platform().is_sm70)
+        chunk = get_schedule().chunked_prefill_size
+        self._chunked_prefill_size = int(chunk) if chunk and chunk > 0 else 0
+        self._sm70_swa_chunks_in_flight = (
+            1 if get_schedule().disable_overlap_schedule else 2
+        )
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # swa_page_size is the model's sliding window (cfg.window_size).
         self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
@@ -1039,42 +1111,78 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c128_state_ratio = 0
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
-        return (
-            # Ring mode: SWA is a fixed per-request pool (see _fixed_swa_bytes).
+        charge_paged_swa = not self._unified and not getattr(
+            self, "_sm70_csa2_skip_paged_swa", False
+        )
+        bpft = (
+            # Ring / SM70-CSA2: SWA is a fixed pool (see _fixed_swa_bytes /
+            # _sm70_vestigial_swa_tokens), not a per-token charge.
             (
-                0.0
-                if self._unified
-                else self.swa_ratio * kv_bytes * self.num_layers_total
+                self.swa_ratio * kv_bytes * self.num_layers_total
+                if charge_paged_swa
+                else 0.0
             )
             + c4_frac * kv_bytes * self.num_layers_ca4
             + 1 / 128 * kv_bytes * self.num_layers_ca128
             + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4
             # Ring mode: C4 state is per-request too (see _fixed_c4_state_bytes).
             + (
-                0.0
-                if self._unified
-                else self.swa_ratio
+                self.swa_ratio
                 * c4_state_ratio
                 * c4_state_bytes
                 * self.num_layers_ca4
+                if charge_paged_swa
+                else 0.0
             )
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
             + (
-                0.0
-                if self._unified
-                else self.swa_ratio
+                self.swa_ratio
                 * c4_state_ratio
                 * c4_indexer_state_bytes
                 * self.num_layers_ca4
+                if charge_paged_swa
+                else 0.0
             )
         )
+        # V4.1 on SM70 has no c4/c128 layers. A zero coeff would make
+        # available/bpft blow up; 64 B/tok is a scheduler placeholder.
+        if getattr(self, "_sm70_csa2_skip_paged_swa", False):
+            bpft = max(bpft, 64.0)
+        return bpft
+
+    def _sm70_vestigial_swa_tokens(self, page_size: int) -> int:
+        """Fixed paged-SWA floor for SM70 CSA2.
+
+        Attention does not read this pool, but SWATokenToKVPoolAllocator still
+        allocates SWA 1:1 with each prefill chunk. A window-only 2-req floor
+        (1024 at page=256) cannot admit chunked_prefill_size=2048, so an 8k
+        request waits forever (relaunch148).
+        """
+        window = int(self.sliding_window_size or self.swa_page_size or 128)
+        # 2-req floor (sticky pin + running) at window+page each, plus slack.
+        floor = 2 * (window + page_size) + page_size
+        chunk = int(getattr(self, "_chunked_prefill_size", 0) or 0)
+        if chunk > 0:
+            chunks_in_flight = int(
+                getattr(self, "_sm70_swa_chunks_in_flight", 2) or 2
+            )
+            floor = max(
+                floor,
+                chunks_in_flight * chunk + 2 * (window + page_size) + page_size,
+            )
+        return floor // page_size * page_size
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
-        swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
-        if not self._unified:
-            # Ring mode: the paged SWA pool is vestigial, so its floor does not apply.
-            self.validate_swa_pool_size(swa_tokens, self.sliding_window_size, page_size)
+        if getattr(self, "_sm70_csa2_skip_paged_swa", False):
+            swa_tokens = self._sm70_vestigial_swa_tokens(page_size)
+        else:
+            swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+            if not self._unified:
+                # Ring mode: the paged SWA pool is vestigial, so its floor does not apply.
+                self.validate_swa_pool_size(
+                    swa_tokens, self.sliding_window_size, page_size
+                )
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 
@@ -343,7 +343,292 @@ def _permute_moe_fp4_scales_for_marlin(
     return torch.stack(tensor_list)
 
 
+def _use_sm70_mxfp4_marlin_pack() -> bool:
+    """True on SM70 when marlin_v100 can repack; loud fail if the stub would run."""
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.get_device_capability()[0] != 7:
+        return False
+    from sglang.srt.layers.quantization.marlin_utils import (
+        _sm70_marlin_v100_available,
+    )
+
+    if not _sm70_marlin_v100_available():
+        raise RuntimeError(
+            "MXFP4 Marlin on SM70 requires marlin_v100 "
+            "(scripts/setup_v100_marlin.sh). The stock JIT gptq_marlin_repack "
+            "is a zero-output stub below SM80; refusing to pack zeros."
+        )
+    return True
+
+
+def _repack_moe_mxfp4_weight_for_sm70_marlin(
+    weight: torch.Tensor,
+    *,
+    num_experts: int,
+    size_n: int,
+    size_k: int,
+    pack_device: torch.device,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """GPTQ-layout view + marlin_v100 SM70 repack, not the Hopper JIT stub.
+
+    Stream one expert at a time. A full-E ``transpose.contiguous()`` of the
+    packed weight is a second copy of the same buffer and OOMs when the
+    device is already near capacity (e.g. after MXFP8 dense unpacks to FP16).
+    ``weight`` should already be on CPU so the original device allocation is
+    free. Pass preallocated ``out`` so the expert-stream scratch cannot
+    fragment the block that the packed tensor is meant to reuse.
+    """
+    from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
+        gptq_marlin_moe_repack,
+    )
+
+    assert weight.shape == (num_experts, size_n, size_k // 2), (
+        f"MXFP4 packed weight must be [E, N, K/2], got {tuple(weight.shape)} "
+        f"vs E={num_experts} N={size_n} K/2={size_k // 2}"
+    )
+    packed_shape = (num_experts, size_k // 16, size_n * 2)
+    if out is not None:
+        if tuple(out.shape) != packed_shape:
+            raise RuntimeError(
+                f"SM70 MXFP4 packed out shape {tuple(out.shape)} != {packed_shape}"
+            )
+        packed = out
+    else:
+        packed = torch.empty(packed_shape, dtype=torch.int32, device="cpu")
+    weight_cpu = weight if weight.device.type == "cpu" else weight.detach().to("cpu")
+    empty_perm = torch.empty((1, 0), dtype=torch.int32, device=pack_device)
+    for e in range(num_experts):
+        w_e = weight_cpu[e : e + 1].to(pack_device)
+        gptq_layout = w_e.contiguous().view(torch.int32).transpose(1, 2).contiguous()
+        del w_e
+        packed_e = gptq_marlin_moe_repack(
+            gptq_layout, empty_perm, size_k, size_n, 4
+        )
+        del gptq_layout
+        packed[e].copy_(packed_e[0] if packed.is_cuda else packed_e[0].cpu())
+        del packed_e
+    del empty_perm
+    if packed.shape[0] != num_experts:
+        raise RuntimeError(
+            "SM70 MXFP4 Marlin repack dropped experts: "
+            f"in={num_experts} out={packed.shape[0]}. Refusing silent drop."
+        )
+    return packed
+
+
+def _prepare_moe_mxfp4_layer_for_sm70_marlin(layer: torch.nn.Module) -> None:
+    """MXFP4 e2m1 + UE8M0 g32 → marlin_v100 W4A16 (logical E8M0 scales).
+
+    Checkpoint:
+      w13/w2 uint8 ``[E, N, K/2]`` (low nibble even-K, high nibble odd-K)
+      scales UE8M0 ``[E, N, K/32]`` (127 = 1.0 = 2**(e-127))
+    Packed:
+      qweight int32 ``[E, K/16, N * 2]`` (u4 packed macro-N)
+      scales  e8m0  ``[E, K/32, N]`` raw bytes, no Hopper permute / pair-swap
+    No global_scale. Activations FP16 only.
+    """
+    from sglang.srt.layers.quantization.marlin_utils import (
+        DSV41_FLASH_MXFP4_GROUP_SIZE,
+        sm70_mxfp4_logical_ue8m0_scales,
+        sm70_mxfp4_refuse_nvfp4_metadata,
+        sm70_mxfp4_ue8m0_to_uint8,
+        sm70_mxfp4_validate_ue8m0_scales,
+    )
+
+    sm70_mxfp4_refuse_nvfp4_metadata(layer)
+
+    group_size = DSV41_FLASH_MXFP4_GROUP_SIZE
+    w13 = layer.w13_weight.data
+    w2 = layer.w2_weight.data
+    w13_scale = _get_optional_param(layer, "w13_weight_scale", "w13_weight_scale_inv")
+    w2_scale = _get_optional_param(layer, "w2_weight_scale", "w2_weight_scale_inv")
+    w13_bias = _get_optional_param(layer, "w13_weight_bias", "w13_bias")
+    w2_bias = _get_optional_param(layer, "w2_weight_bias", "w2_bias")
+
+    if w13_scale is None or w2_scale is None:
+        raise ValueError("MXFP4 Marlin requires w13/w2 weight scales.")
+
+    w13_scale_data = w13_scale.data if hasattr(w13_scale, "data") else w13_scale
+    w2_scale_data = w2_scale.data if hasattr(w2_scale, "data") else w2_scale
+    w13_bias_data = w13_bias.data if hasattr(w13_bias, "data") else w13_bias
+    w2_bias_data = w2_bias.data if hasattr(w2_bias, "data") else w2_bias
+
+    if w13_scale_data.dtype == torch.float8_e4m3fn or (
+        w2_scale_data.dtype == torch.float8_e4m3fn
+    ):
+        raise RuntimeError(
+            "MXFP4 experts are UE8M0 g32, not NVFP4 E4M3 g16. "
+            "Refusing to approximately pack."
+        )
+
+    num_experts = w13.shape[0]
+    intermediate_size = w13.shape[1] // 2
+    hidden_size = w13.shape[2] * 2
+    if hidden_size % 128 == 0:
+        padded_intermediate_size = ((intermediate_size + 63) // 64) * 64
+    else:
+        if hidden_size % 64 != 0:
+            raise ValueError(
+                f"MXFP4 Marlin requires hidden_size to be divisible by 64, "
+                f"got {hidden_size}."
+            )
+        padded_intermediate_size = ((intermediate_size + 127) // 128) * 128
+
+    param_dtype = getattr(
+        layer,
+        "orig_dtype",
+        w13_bias_data.dtype if w13_bias_data is not None else torch.float16,
+    )
+    if param_dtype != torch.float16:
+        raise RuntimeError(
+            "SM70 MXFP4 Marlin is W4A16 FP16 (V100 has no BF16 tensor cores). "
+            f"got orig_dtype={param_dtype}."
+        )
+
+    src_was_cuda = bool(w13.is_cuda)
+    pack_device = (
+        w13.device
+        if src_was_cuda
+        else torch.device(f"cuda:{torch.cuda.current_device()}")
+    )
+
+    def _pad_w13(x: torch.Tensor) -> torch.Tensor:
+        if padded_intermediate_size == intermediate_size:
+            return x
+        x = x.view(num_experts, 2, intermediate_size, x.shape[-1])
+        x = torch.nn.functional.pad(
+            x, (0, 0, 0, padded_intermediate_size - intermediate_size)
+        )
+        return x.reshape(num_experts, 2 * padded_intermediate_size, -1)
+
+    def _pad_w2(x: torch.Tensor, packing: int) -> torch.Tensor:
+        if padded_intermediate_size == intermediate_size:
+            return x
+        return torch.nn.functional.pad(
+            x, (0, (padded_intermediate_size - intermediate_size) // packing)
+        )
+
+    w13_size_n, w13_size_k = padded_intermediate_size * 2, hidden_size
+    w2_size_n, w2_size_k = hidden_size, padded_intermediate_size
+
+    import gc
+
+    def _pack_attr(attr: str, pad_fn, size_n: int, size_k: int) -> torch.Tensor:
+        param = getattr(layer, attr)
+        cpu = param.detach().to("cpu").contiguous()
+        cpu = pad_fn(cpu)
+        packed_shape = (num_experts, size_k // 16, size_n * 2)
+        packed_nbytes = packed_shape[0] * packed_shape[1] * packed_shape[2] * 4
+        packed_out = None
+        if (
+            src_was_cuda
+            and param.is_cuda
+            and param.untyped_storage().nbytes() == packed_nbytes
+        ):
+            # Same-sized rewrite: packed int32 overwrites the checkpoint
+            # bytes in place. Source is the CPU copy.
+            packed_out = param.data.contiguous().view(torch.int32).reshape(
+                *packed_shape
+            )
+        else:
+            delattr(layer, attr)
+            del param
+            gc.collect()
+        if getattr(layer, "workspace", None) is None:
+            layer.workspace = marlin_make_workspace(pack_device, 4)
+        packed = _repack_moe_mxfp4_weight_for_sm70_marlin(
+            cpu,
+            num_experts=num_experts,
+            size_n=size_n,
+            size_k=size_k,
+            pack_device=pack_device,
+            out=packed_out,
+        )
+        del cpu
+        gc.collect()
+        setattr(layer, attr, torch.nn.Parameter(packed, requires_grad=False))
+        return packed
+
+    # Drop locals that alias GPU storage before packing so the hole is real.
+    w13 = None
+    w2_hold = w2
+    w2 = None
+    w13_marlin = _pack_attr("w13_weight", _pad_w13, w13_size_n, w13_size_k)
+    del w2_hold
+    w2_marlin = _pack_attr(
+        "w2_weight", lambda t: _pad_w2(t, packing=2), w2_size_n, w2_size_k
+    )
+
+    w13_scale_cpu = w13_scale_data.detach().to("cpu").contiguous()
+    w2_scale_cpu = w2_scale_data.detach().to("cpu").contiguous()
+    w13_bias_cpu = (
+        w13_bias_data.detach().to("cpu").contiguous()
+        if w13_bias_data is not None
+        else None
+    )
+    w2_bias_cpu = (
+        w2_bias_data.detach().to("cpu").contiguous()
+        if w2_bias_data is not None
+        else None
+    )
+    w13_scale_u8 = _pad_w13(sm70_mxfp4_ue8m0_to_uint8(w13_scale_cpu))
+    w2_scale_u8 = _pad_w2(
+        sm70_mxfp4_ue8m0_to_uint8(w2_scale_cpu), packing=group_size
+    )
+    del w13_scale_cpu, w2_scale_cpu
+    sm70_mxfp4_validate_ue8m0_scales(w13_scale_u8)
+    sm70_mxfp4_validate_ue8m0_scales(w2_scale_u8)
+    if w13_bias_cpu is not None:
+        w13_bias_cpu = _pad_w13(w13_bias_cpu.unsqueeze(-1)).squeeze(-1)
+
+    w13_scale_marlin = sm70_mxfp4_logical_ue8m0_scales(
+        w13_scale_u8, size_k=w13_size_k, size_n=w13_size_n, group_size=group_size
+    )
+    w2_scale_marlin = sm70_mxfp4_logical_ue8m0_scales(
+        w2_scale_u8, size_k=w2_size_k, size_n=w2_size_n, group_size=group_size
+    )
+    if src_was_cuda:
+        w13_scale_marlin = w13_scale_marlin.to(pack_device)
+        w2_scale_marlin = w2_scale_marlin.to(pack_device)
+
+    if w13_marlin.shape[0] != num_experts or w2_marlin.shape[0] != num_experts:
+        raise RuntimeError(
+            "SM70 MXFP4 Marlin would drop experts "
+            f"(in={num_experts}, w13={w13_marlin.shape[0]}, "
+            f"w2={w2_marlin.shape[0]})."
+        )
+
+    layer.w13_weight_scale = torch.nn.Parameter(w13_scale_marlin, requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(w2_scale_marlin, requires_grad=False)
+
+    # SM70 kernels consume logical N-contiguous bias, matching FP8 Marlin.
+    if w13_bias_cpu is not None:
+        layer.w13_weight_bias = torch.nn.Parameter(
+            w13_bias_cpu.to(
+                device=pack_device if src_was_cuda else "cpu", dtype=param_dtype
+            ),
+            requires_grad=False,
+        )
+    if w2_bias_cpu is not None:
+        layer.w2_weight_bias = torch.nn.Parameter(
+            w2_bias_cpu.to(
+                device=pack_device if src_was_cuda else "cpu", dtype=param_dtype
+            ),
+            requires_grad=False,
+        )
+
+    for stale in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+        if hasattr(layer, stale):
+            delattr(layer, stale)
+
+
 def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
+    if _use_sm70_mxfp4_marlin_pack():
+        _prepare_moe_mxfp4_layer_for_sm70_marlin(layer)
+        return
+
     group_size = 32
     w13 = layer.w13_weight.data
     w2 = layer.w2_weight.data

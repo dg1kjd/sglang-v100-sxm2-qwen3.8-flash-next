@@ -399,6 +399,14 @@ def handle_model_specific_adjustments(server_args: Any):
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+        elif get_platform().is_sm70:
+            # Volta has no DeepGEMM / TileLang MHC. Decoder uses sm70_dsv41_hc_*.
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+            if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+            if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
         elif get_platform().is_hip:
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             # The fp8 wo_a GEMM is DeepGEMM-based on CUDA. ROCm has an aiter
@@ -592,6 +600,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
     ]:
         # The quantization/moe_runner_backend resolution moved to the
         # override registry (arg_groups/overrides.py:

@@ -43,11 +43,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
-  m.def(
-      "cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe, Tensor kv_c_and_k_pe_cache, Tensor seq_lens, Tensor "
-      "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
-  m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
-  m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
 
   /*
    * From csrc/infllm_v2
@@ -108,13 +103,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
   /*
-    * From csrc/gemm
-    */
-#if !defined(SGL_KERNEL_V100_ONLY)
-  m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
-  m.impl("awq_dequantize", torch::kCUDA, &awq_dequantize);
-#endif
-
+   * From csrc/gemm
+   */
   m.def(
       "int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
       "bias) -> Tensor");
@@ -139,17 +129,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // but external sgl_kernel consumers still rely on this exported CUDA op.
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
-
-  /*
-   * From csrc/gemm/gptq
-   */
-  m.def(
-      "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool "
-      "use_shuffle, int bit) -> Tensor");
-  m.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
-
-  m.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
-  m.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
 
   /*
    * From csrc/moe
@@ -201,8 +180,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
 
-// DeepSeek-V4 fused norm + rope, fused qk norm rope — uses sm80+ BF16 intrinsics
 #if !defined(SGL_KERNEL_V100_ONLY)
+  // DeepSeek-V4 fused norm + rope, fused qk norm rope — uses sm80+ BF16 intrinsics
   m.def(
       "dsv4_fused_q_norm_rope(Tensor q_input, Tensor! q_output, Tensor freqs_cis, Tensor positions, float eps) -> ()");
   m.impl("dsv4_fused_q_norm_rope", torch::kCUDA, &dsv4_fused_q_norm_rope);
@@ -360,52 +339,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
 
   /*
-   * From Sparse Flash Attention
-   */
-#if !defined(SGL_KERNEL_V100_ONLY)
-  m.def(
-      "fwd_sparse(Tensor! q, Tensor k, Tensor v, "
-      "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
-      "Tensor!? out, Tensor? alibi_slopes, "
-      "float p_dropout, float softmax_scale, bool is_causal, "
-      "float softcap, bool return_softmax, Generator? gen)"
-      "-> Tensor[]");
-  m.impl("fwd_sparse", torch::kCUDA, &flash::mha_fwd_sparse);
-
-  m.def(
-      "varlen_fwd_sparse(Tensor! q, Tensor k, Tensor v, "
-      "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
-      "Tensor!? out, Tensor cu_seqlens_q, "
-      "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? alibi_slopes, "
-      "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
-      "bool is_causal, float softcap, bool return_softmax, "
-      "Generator? gen) -> Tensor[]");
-  m.impl("varlen_fwd_sparse", torch::kCUDA, &flash::mha_varlen_fwd_sparse);
-#endif
-
-  // Sparse Attention utils
-  m.def(
-      "convert_vertical_slash_indexes("
-      "   Tensor! block_count, Tensor! block_offset, "
-      "   Tensor! column_count, Tensor! column_index, "
-      "   Tensor q_seqlens, Tensor q_seqlens, "
-      "   Tensor vertical_indexes, Tensor slash_indexes, "
-      "   int context_size, int block_size_M, int block_size_N, "
-      "   bool causal) -> ()");
-  m.impl("convert_vertical_slash_indexes", torch::kCUDA, &convert_vertical_slash_indexes);
-
-  m.def(
-      "convert_vertical_slash_indexes_mergehead("
-      "   Tensor! block_count, Tensor! block_offset, "
-      "   Tensor! column_count, Tensor! column_index, "
-      "   Tensor q_seqlens, Tensor q_seqlens, "
-      "   Tensor vertical_indexes, Tensor slash_indexes, "
-      "   Tensor vertical_indices_count, Tensor slash_indices_count, "
-      "   int context_size, int block_size_M, int block_size_N, "
-      "   bool causal) -> ()");
-  m.impl("convert_vertical_slash_indexes_mergehead", torch::kCUDA, &convert_vertical_slash_indexes_mergehead);
-
-  /*
    * From csrc/grammar
    */
   m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
@@ -471,8 +404,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
 
   /*
-    * From csrc/expert_sepcialization
-    */
+   * From csrc/expert_sepcialization
+   */
 #if !defined(SGL_KERNEL_V100_ONLY)
   m.def(
       "es_fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "

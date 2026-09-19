@@ -547,6 +547,11 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
 
     # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        # CUDA-graph capture also takes this hook. Draft/nextn forwards that
+        # omit with_current_layer leave layer_idx None; skip rather than
+        # scatter into `_data[None, :]`.
+        if layer_idx is None:
+            return
         topk_ids = topk_ids.flatten()
         mask = topk_ids != -1
         self._data[layer_idx, :].scatter_add_(

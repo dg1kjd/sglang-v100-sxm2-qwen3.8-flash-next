@@ -166,6 +166,69 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
 
         self.assertIs(result, inner)
 
+    def test_sticky_wraps_chunk_cache_when_env_on(self):
+        from sglang.srt.environ import envs
+
+        inner = MagicMock()
+        inner.supports_streaming_session.return_value = False
+        inner.is_chunk_cache.return_value = True
+        inner.cache_controller = None
+        register_radix_cache_backend("chunky", MagicMock(return_value=inner))
+
+        envs.SGLANG_DSV41_STICKY_LAST_SEQ.set(True)
+        self.addCleanup(envs.SGLANG_DSV41_STICKY_LAST_SEQ.clear)
+
+        with patch(
+            "sglang.srt.mem_cache.sticky_last_sequence.StickyLastSequenceCache"
+        ) as sticky_cls:
+            sticky_cls.return_value = MagicMock(name="sticky")
+            result = create_tree_cache(_make_ctx(self, backend="chunky"))
+
+        sticky_cls.assert_called_once_with(inner)
+        self.assertIs(result, sticky_cls.return_value)
+
+    def test_sticky_skipped_when_streaming_session_on(self):
+        from sglang.srt.environ import envs
+
+        inner = MagicMock()
+        inner.supports_streaming_session.return_value = False
+        inner.is_chunk_cache.return_value = True
+        inner.cache_controller = None
+        register_radix_cache_backend("chunky", MagicMock(return_value=inner))
+
+        envs.SGLANG_DSV41_STICKY_LAST_SEQ.set(True)
+        self.addCleanup(envs.SGLANG_DSV41_STICKY_LAST_SEQ.clear)
+
+        with patch(
+            "sglang.srt.session.streaming_session.StreamingSession"
+        ) as session_cls:
+            session_cls.return_value = MagicMock(name="wrapped")
+            with patch(
+                "sglang.srt.mem_cache.sticky_last_sequence.StickyLastSequenceCache"
+            ) as sticky_cls:
+                result = create_tree_cache(
+                    _make_ctx(self, backend="chunky", enable_streaming=True)
+                )
+
+        session_cls.assert_called_once_with(inner)
+        sticky_cls.assert_not_called()
+        self.assertIs(result, session_cls.return_value)
+
+    def test_sticky_skipped_when_not_chunk_cache(self):
+        from sglang.srt.environ import envs
+
+        inner = MagicMock()
+        inner.supports_streaming_session.return_value = False
+        inner.is_chunk_cache.return_value = False
+        inner.cache_controller = None
+        register_radix_cache_backend("radixy", MagicMock(return_value=inner))
+
+        envs.SGLANG_DSV41_STICKY_LAST_SEQ.set(True)
+        self.addCleanup(envs.SGLANG_DSV41_STICKY_LAST_SEQ.clear)
+
+        result = create_tree_cache(_make_ctx(self, backend="radixy"))
+        self.assertIs(result, inner)
+
 
 class TestDefaultRadixCacheFactory(CustomTestCase):
     """Branch coverage for the built-in radix cache selection chain.

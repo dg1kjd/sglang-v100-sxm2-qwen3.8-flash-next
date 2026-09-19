@@ -1,3 +1,9 @@
+"""Fixed-width DSpark SM70 wrapper used by unit tests.
+
+Launch path is ``sglang.srt.speculative.dspark_components.dspark_worker_v2``.
+Do not construct this class from SpeculativeAlgorithm.DSPARK.
+"""
+
 import logging
 from typing import Optional
 

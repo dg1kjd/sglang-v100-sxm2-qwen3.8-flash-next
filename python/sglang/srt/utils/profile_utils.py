@@ -175,6 +175,10 @@ class ProfileManager:
 
 
 def _get_stage_from_forward_mode(forward_mode: ForwardMode):
+    # TARGET_VERIFY is also is_prefill(); name it before that fold so DSpark
+    # verify can be captured without mixing in EXTEND.
+    if forward_mode.is_target_verify():
+        return "verify"
     if forward_mode.is_prefill():
         return "prefill"
     elif forward_mode.is_decode():
@@ -406,14 +410,18 @@ class _ProfilerMemory(_ProfilerConcreteBase):
 
 class _ProfilerCudart(_ProfilerConcreteBase):
     def start(self):
-        if self.first_rank_in_node:
-            logger.info(f"Call cudaProfilerStart")
-            torch.cuda.cudart().cudaProfilerStart()
+        # Every TP rank has its own process/GPU. Rank-0-only Start leaves
+        # nsys --capture-range=cudaProfilerApi empty on the other 7 ranks.
+        torch.distributed.barrier(self.cpu_group)
+        logger.info("Call cudaProfilerStart")
+        torch.cuda.cudart().cudaProfilerStart()
+        torch.distributed.barrier(self.cpu_group)
 
     def stop(self):
-        if self.first_rank_in_node:
-            logger.info(f"Call cudaProfilerStop")
-            torch.cuda.cudart().cudaProfilerStop()
+        torch.distributed.barrier(self.cpu_group)
+        logger.info("Call cudaProfilerStop")
+        torch.cuda.cudart().cudaProfilerStop()
+        torch.distributed.barrier(self.cpu_group)
 
 
 class _ProfilerRPD(_ProfilerConcreteBase):

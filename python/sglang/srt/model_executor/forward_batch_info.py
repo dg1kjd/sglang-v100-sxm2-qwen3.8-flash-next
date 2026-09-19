@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_lora,
     get_parallel,
     mamba_cache_chunk_size,
@@ -303,14 +304,20 @@ def compute_local_num_token_non_padded_cpu(
 
 
 def prefill_graph_tolerates_sum_len() -> bool:
-    """Whether MegaMoE may replay prefill graphs with local shapes."""
+    """Whether MegaMoE may replay prefill graphs with per-rank SUM_LEN buckets.
+
+    The graph body is captured with MAX_LEN geometry, so a graph that recorded
+    a DP gather/scatter only replays correctly when every rank uses one bucket.
+    """
     from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-    from sglang.srt.layers.cp.utils import is_mla_prefill_cp_enabled
+    from sglang.srt.layers.cp.utils import is_mla_cp_enabled
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if not get_moe_a2a_backend().is_megamoe():
         return False
-    return not (is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled())
+    if get_flags().dp.prefill_graph_has_dp_gather:
+        return False
+    return not (is_dsa_enable_prefill_cp() or is_mla_cp_enabled())
 
 
 @dataclass
@@ -615,6 +622,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
+    # Engram extend predecessors (n-1 tokens per request). None: hasher
+    # history rows via req_pool_indices.
+    ngram_history: Optional[torch.Tensor] = None
 
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
@@ -1065,11 +1075,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         The extra-buffer scheduler parks its snapshot at a
         ``mamba_cache_chunk_size`` boundary, not at the current position, so
-        anything snapshotting alongside it needs the same boundary. None when
-        tracking metadata is absent (no mask, or a prefill CUDA-graph replay
-        that does not carry ``mamba_track_seqlens`` -- mamba skips tracking
-        there too). Masked-off rows hold garbage and are the caller's mask to
-        handle.
+        anything snapshotting alongside it needs the same boundary; the +1
+        that _force_track_h adds cancels under the floor. Sole home of this
+        math: every side state snapshotting alongside mamba calls it. None
+        when tracking metadata is absent (no mask, or a prefill CUDA-graph
+        replay that does not carry ``mamba_track_seqlens`` -- mamba skips
+        tracking there too). Masked-off rows hold garbage and are the caller's
+        mask to handle.
         """
         if (
             self.mamba_track_mask is None

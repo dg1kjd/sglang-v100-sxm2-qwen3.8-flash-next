@@ -164,11 +164,14 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
+        or a2a_backend.is_flashinfer_megamoe()
         or a2a_backend.is_ascend_fuseep()
     ):
         # ascend_fuseep bypasses the dispatcher abstraction (see
         # forward_fuseep in hardware_backend/npu/moe/fuseep.py); a
         # StandardDispatcher is created but never invoked.
+        # flashinfer_megamoe does its EP all-to-all inside the kernel, so the
+        # dispatcher stays a pure noop passthrough.
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
@@ -492,9 +495,22 @@ class FusedMoE(torch.nn.Module):
                 f"quant_method={type(self.quant_method).__name__})."
             )
 
+        from sglang.srt.layers.moe.dsv41_expert_spill import (
+            alloc_spill_host_buffers,
+            plan_gpu_expert_slots,
+        )
+
+        gpu_n, spill_plan = plan_gpu_expert_slots(
+            num_local_experts=self.num_local_experts,
+            n_shared=int(self.num_fused_shared_experts),
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=self.intermediate_size_per_partition,
+        )
+        self._dsv41_gpu_expert_slots = gpu_n
+
         self.quant_method.create_weights(
             layer=self,
-            num_experts=self.num_local_experts,
+            num_experts=gpu_n,
             hidden_size=hidden_size,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
@@ -506,6 +522,8 @@ class FusedMoE(torch.nn.Module):
             with_bias=with_bias,
             moe_intermediate_size=intermediate_size,
         )
+        if spill_plan is not None and spill_plan.n_spilled:
+            alloc_spill_host_buffers(self, spill_plan)
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
@@ -957,10 +975,18 @@ class FusedMoE(torch.nn.Module):
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
     ):
-        param_data = param.data
+        from sglang.srt.layers.moe.dsv41_expert_spill import (
+            remap_shared_expert_gpu_index,
+            spilled_expert_host_row,
+        )
 
-        # Input scales can be loaded directly and should be equal.
-        param_data[expert_id] = loaded_weight
+        spilled = spilled_expert_host_row(self, param, expert_id)
+        if spilled is not None:
+            host, host_row = spilled
+            host[host_row] = loaded_weight
+            return
+        expert_id = remap_shared_expert_gpu_index(self, expert_id)
+        param.data[expert_id] = loaded_weight
 
     def _load_g_idx(
         self,
@@ -1221,7 +1247,18 @@ class FusedMoE(torch.nn.Module):
         # dimension intermediate_size is used.
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
 
-        expert_data = param.data[expert_id]
+        from sglang.srt.layers.moe.dsv41_expert_spill import (
+            remap_shared_expert_gpu_index,
+            spilled_expert_host_row,
+        )
+
+        spilled = spilled_expert_host_row(self, param, expert_id)
+        if spilled is not None:
+            host, host_row = spilled
+            expert_data = host[host_row]
+        else:
+            expert_id = remap_shared_expert_gpu_index(self, expert_id)
+            expert_data = param.data[expert_id]
 
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors
@@ -1503,6 +1540,14 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
+        if envs.SGLANG_DEBUG_DSV41_PROBE_STATS.get():
+            from sglang.srt.debug.dsv41_probe_stats import record_moe
+
+            record_moe(self.layer_id, hidden_states, topk_output)
+        if envs.SGLANG_DEBUG_DSV41_ALIGN_DUMP.get():
+            from sglang.srt.debug.dsv41_align_dump import record_moe_row
+
+            record_moe_row(self.layer_id, hidden_states, topk_output)
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
@@ -1608,6 +1653,12 @@ class FusedMoE(torch.nn.Module):
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
+        if getattr(self, "_dsv41_expert_lru", None) is not None:
+            from sglang.srt.layers.moe.dsv41_expert_spill import (
+                remap_dispatch_for_expert_spill,
+            )
+
+            dispatch_output = remap_dispatch_for_expert_spill(self, dispatch_output)
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,

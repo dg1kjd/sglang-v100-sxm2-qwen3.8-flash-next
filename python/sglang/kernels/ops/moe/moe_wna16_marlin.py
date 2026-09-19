@@ -48,7 +48,83 @@ _SM70_MARLIN_MOE_ENV_NAMES = (
 _sm70_marlin_user_tuning = any(
     os.getenv(name) for name in _SM70_MARLIN_MOE_ENV_NAMES
 )
-_sm70_qwen38_tuning_stage = None
+_sm70_marlin_tuning_stage = None
+
+# WO-13 D6 sweep (scripts/dsv41_sm70_marlin_decode_sweep.py, 2026-09-16):
+# auto (packed_macro_n=256 default 32x256x32x4x32x64x32 sk=1) was 588/274 us
+# for w13/w2. Exact-match winner for both GEMMs is 32x128x32x4x32x32x32 sk=1
+# (~390/184 us eager, 1.29x as a captured pair). split_k=4 is ~9 us faster
+# on w13 but drifts by 0.0625 vs auto; keep sk=1.
+_DSV41_DECODE_MARLIN_GEOM = "32x128x32x4x32x32x32"
+_DSV41_DECODE_MARLIN_VALUES = (_DSV41_DECODE_MARLIN_GEOM, "1", "vector_words")
+
+
+def _sm70_marlin_moe_stage_values(
+    scale_dtype: torch.dtype,
+    moe_block_size: int,
+    top_k: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+) -> Optional[tuple[str, tuple[str, str, str]]]:
+    """Return (stage, env-triple) for a measured SM70 Marlin MoE shape, or None."""
+    if (
+        scale_dtype == torch.float8_e4m3fn
+        and moe_block_size == 8
+        and top_k == 10
+        and size_m == 1
+        and size_n == 320
+        and size_k == 2560
+    ):
+        return "qwen38_w13_decode", ("32x64x64x4x32x64x16", "1", "vector_words")
+    if (
+        scale_dtype == torch.float8_e4m3fn
+        and moe_block_size == 32
+        and top_k == 10
+        and 512 <= size_m <= 2048
+        and size_n == 320
+        and size_k == 2560
+    ):
+        return "qwen38_w13_prefill", ("32x64x64x4x32x32x32", "1", "vector_words")
+    if (
+        scale_dtype == torch.float8_e4m3fn
+        and moe_block_size == 64
+        and top_k == 1
+        and size_m >= 40960
+        and size_n == 2560
+        and size_k == 160
+    ):
+        return "qwen38_w2_prefill", ("64x256x32x4x64x64x32", "1", "vector_words")
+    if (
+        scale_dtype == torch.float8_e4m3fn
+        and moe_block_size == 8
+        and top_k == 1
+        and size_m == 10
+        and size_n == 2560
+        and size_k == 160
+    ):
+        return "qwen38_w2_decode", ("64x256x32x4x64x64x32", "1", "lane_vectors")
+    # DeepSeek-V4.1-Flash MXFP4 decode (and 1-token extend). Prefill M>>1
+    # keeps marlin_v100's generic selector.
+    if (
+        scale_dtype == torch.float8_e8m0fnu
+        and moe_block_size == 8
+        and top_k == 6
+        and size_m == 1
+        and size_n == 4608
+        and size_k == 5120
+    ):
+        return "dsv41_w13_decode", _DSV41_DECODE_MARLIN_VALUES
+    if (
+        scale_dtype == torch.float8_e8m0fnu
+        and moe_block_size == 8
+        and top_k == 1
+        and size_m == 6
+        and size_n == 5120
+        and size_k == 2304
+    ):
+        return "dsv41_w2_decode", _DSV41_DECODE_MARLIN_VALUES
+    return None
 
 
 def _configure_sm70_qwen38_nvfp4_stage(
@@ -59,41 +135,27 @@ def _configure_sm70_qwen38_nvfp4_stage(
     size_n: int,
     size_k: int,
 ) -> None:
-    """Select the measured TP4 decode geometry before CUDA-graph capture.
+    """Select a measured CTA geometry before CUDA-graph capture.
 
     marlin_v100 reads these variables synchronously when its host launcher is
     called.  SGLang captures the resulting kernels in the decode CUDA graph,
-    so there is no environment handling on graph replay.  Large-M/prefill
-    shapes clear the override and retain marlin_v100's generic/model selectors.
+    so there is no environment handling on graph replay. Unmatched shapes
+    clear the override and retain marlin_v100's generic/model selectors.
     """
-    global _sm70_qwen38_tuning_stage
+
+    global _sm70_marlin_tuning_stage
     if not _IS_SM70 or _sm70_marlin_user_tuning:
         return
 
-    stage = None
-    values = None
-    if (
-        b_scales.dtype == torch.float8_e4m3fn
-        and moe_block_size == 8
-        and top_k == 10
-        and size_m == 1
-        and size_n == 320
-        and size_k == 2560
-    ):
-        stage = 1
-        values = ("32x64x64x4x32x64x16", "1", "vector_words")
-    elif (
-        b_scales.dtype == torch.float8_e4m3fn
-        and moe_block_size == 8
-        and top_k == 1
-        and size_m == 10
-        and size_n == 2560
-        and size_k == 160
-    ):
-        stage = 2
-        values = ("64x256x32x4x64x64x32", "1", "lane_vectors")
+    hit = _sm70_marlin_moe_stage_values(
+        b_scales.dtype, moe_block_size, top_k, size_m, size_n, size_k
+    )
+    if hit is None:
+        stage, values = None, None
+    else:
+        stage, values = hit
 
-    if stage == _sm70_qwen38_tuning_stage:
+    if stage == _sm70_marlin_tuning_stage:
         return
     if values is None:
         for name in _SM70_MARLIN_MOE_ENV_NAMES:
@@ -101,7 +163,7 @@ def _configure_sm70_qwen38_nvfp4_stage(
     else:
         for name, value in zip(_SM70_MARLIN_MOE_ENV_NAMES, values):
             os.environ[name] = value
-    _sm70_qwen38_tuning_stage = stage
+    _sm70_marlin_tuning_stage = stage
 
 
 def _load_marlin_v100_op():
@@ -239,6 +301,10 @@ def moe_wna16_marlin_gemm(
                 size_n,
                 size_k,
             )
+            # marlin_v100's epilogue reads topk_weights as float32
+            # (`data_ptr<float>()`). Hopper fused_marlin_moe passes FP16/BF16.
+            if topk_weights.dtype != torch.float32:
+                topk_weights = topk_weights.float()
             op(
                 a,
                 c,

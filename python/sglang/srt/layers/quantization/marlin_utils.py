@@ -473,6 +473,161 @@ def sm70_marlin_moe_logical_scales(
     return s.reshape((s.shape[0], -1, size_n)).contiguous()
 
 
+# SM70 marlin_v100 MXFP4 maps each UE8M0 byte `b` to FP16 as
+#   e = clamp(b - 112, 0, 31); value = 2^(e - 15)
+# which equals the OCP value 2^(b - 127) iff b ∈ [113, 142].
+# Byte 0 (zero-padding) flushes to +0. Hopper BF16 bit-shifts the full
+# E8M0 range (~2^-126 .. 2^127); we refuse out-of-range bytes rather than
+# silently clamp.
+SM70_MXFP4_UE8M0_FP16_EXACT_MIN = 113
+SM70_MXFP4_UE8M0_FP16_EXACT_MAX = 142
+
+# DeepSeek-V4.1-Flash routed-expert geometry. Not V4-Flash.
+DSV41_FLASH_HIDDEN_SIZE = 5120
+DSV41_FLASH_MOE_INTERMEDIATE_SIZE = 2304
+DSV41_FLASH_NUM_ROUTED_EXPERTS = 384
+DSV41_FLASH_NUM_EXPERTS_PER_TOK = 6
+DSV41_FLASH_MXFP4_GROUP_SIZE = 32
+
+
+def sm70_mxfp4_ue8m0_to_uint8(scales: torch.Tensor) -> torch.Tensor:
+    """Return raw UE8M0 bytes without a numerical round-trip.
+
+    Checkpoint-native ``float8_e8m0fnu`` / ``uint8`` are a view. Float
+    containers must already hold exact powers of two (``2**(e-127)``).
+    """
+    if scales.dtype == torch.float8_e8m0fnu:
+        return scales.view(torch.uint8)
+    if scales.dtype == torch.uint8:
+        return scales
+    if scales.dtype == torch.int8:
+        return scales.view(torch.uint8)
+    if scales.dtype in (torch.float32, torch.float16, torch.bfloat16):
+        finite = torch.isfinite(scales.float())
+        positive = scales.float() > 0
+        if bool((~finite | ~positive).any()):
+            raise RuntimeError(
+                "MXFP4 UE8M0 float scales must be finite and positive "
+                f"(got min={float(scales.float().min())}, "
+                f"max={float(scales.float().max())})."
+            )
+        log2_val = torch.log2(scales.float())
+        rounded = torch.round(log2_val)
+        if not torch.allclose(log2_val, rounded, atol=1e-4, rtol=0.0):
+            raise RuntimeError(
+                "MXFP4 UE8M0 float scales must be exact powers of two; "
+                "refusing a close-enough reinterpret as E8M0."
+            )
+        byte = (rounded + 127).to(torch.int32)
+        if bool((byte < 0).any() or (byte > 255).any()):
+            raise RuntimeError(
+                "MXFP4 UE8M0 exponent does not fit in a byte "
+                f"(got {int(byte.min())} .. {int(byte.max())})."
+            )
+        return byte.to(torch.uint8)
+    raise TypeError(f"Unsupported MXFP4 UE8M0 scale dtype: {scales.dtype}")
+
+
+def sm70_mxfp4_validate_ue8m0_scales(scales: torch.Tensor) -> None:
+    """Fail loud if any non-padding UE8M0 byte is outside the FP16-exact range."""
+    raw = sm70_mxfp4_ue8m0_to_uint8(scales)
+    in_range = (raw == 0) | (
+        (raw >= SM70_MXFP4_UE8M0_FP16_EXACT_MIN)
+        & (raw <= SM70_MXFP4_UE8M0_FP16_EXACT_MAX)
+    )
+    if bool(in_range.all()):
+        return
+    bad = raw[~in_range]
+    raise RuntimeError(
+        "SM70 marlin_v100 MXFP4 dequantizes UE8M0 in FP16 as "
+        "clamp(byte-112, 0, 31) << 10, which is exact only for bytes in "
+        f"{{0}} ∪ [{SM70_MXFP4_UE8M0_FP16_EXACT_MIN}, "
+        f"{SM70_MXFP4_UE8M0_FP16_EXACT_MAX}] (2^-14 .. 2^15). "
+        f"Found out-of-range bytes {int(bad.min())}..{int(bad.max())}. "
+        "Refusing to clamp (Hopper BF16 Marlin would keep these exponents)."
+    )
+
+
+def sm70_mxfp4_logical_ue8m0_scales(
+    scales: torch.Tensor,
+    *,
+    size_k: int,
+    size_n: int,
+    group_size: int = DSV41_FLASH_MXFP4_GROUP_SIZE,
+) -> torch.Tensor:
+    """Checkpoint ``[E, N, K/32]`` UE8M0 → logical ``[E, K/32, N]`` E8M0.
+
+    marlin_v100 indexes ``scales_ + group * size_n + cache_n`` as raw E8M0
+    bytes. Do **not** apply Hopper ``marlin_permute_scales`` or the 16-bit
+    pair-swap in ``mxfp4_marlin_process_scales`` — both corrupt SM70 metadata.
+    Do **not** encode NVFP4 S0E5M3; MXFP4 has no global_scale.
+    """
+    if group_size != 32:
+        raise ValueError(
+            f"Official MXFP4 is UE8M0 g32, got group_size={group_size}."
+        )
+    if size_k % group_size != 0:
+        raise ValueError(f"size_k={size_k} is not divisible by group_size=32.")
+    if scales.ndim != 3:
+        raise ValueError(
+            f"MXFP4 UE8M0 scales must be rank-3 [E, N, K/32] or "
+            f"[E, K/32, N], got shape={tuple(scales.shape)}"
+        )
+    if scales.dtype == torch.float8_e4m3fn:
+        raise RuntimeError(
+            "MXFP4 experts are UE8M0 g32, not NVFP4 E4M3 g16. "
+            "Refusing to approximately pack."
+        )
+
+    num_groups = size_k // group_size
+    raw = sm70_mxfp4_ue8m0_to_uint8(scales)
+    sm70_mxfp4_validate_ue8m0_scales(raw)
+
+    if raw.shape[1] == size_n and raw.shape[2] == num_groups:
+        logical = raw.transpose(1, 2).contiguous()
+    elif raw.shape[1] == num_groups and raw.shape[2] == size_n:
+        logical = raw.contiguous()
+    else:
+        raise ValueError(
+            "MXFP4 UE8M0 scales must be [E, N, K/32] (checkpoint) or "
+            f"[E, K/32, N] (logical); got shape={tuple(raw.shape)} "
+            f"with N={size_n}, K/32={num_groups}."
+        )
+    return sm70_marlin_moe_logical_scales(
+        logical.view(torch.float8_e8m0fnu), size_k, size_n, group_size
+    )
+
+
+def sm70_mxfp4_refuse_nvfp4_metadata(layer: torch.nn.Module) -> None:
+    """MXFP4 has no NVFP4 global scale / g16 E4M3 block scales."""
+    for name in (
+        "w13_weight_scale_2",
+        "w2_weight_scale_2",
+        "w13_global_scale",
+        "w2_global_scale",
+        "weight_global_scale",
+    ):
+        value = getattr(layer, name, None)
+        if value is not None:
+            raise RuntimeError(
+                "MXFP4 (e2m1 + UE8M0 g32) has no NVFP4 global_scale. "
+                f"Found {name}={type(value)}; refusing to pack into "
+                "sm70_nvfp4_moe_decode or NVFP4 Marlin metadata."
+            )
+
+
+def sm70_mxfp4_fused_decode_expert_limit() -> int | None:
+    """Expert-count cap of the SM70 fused MXFP4 decode, or None if uncapped.
+
+    ``marlin_v100 moe_wna16_marlin_gemm`` takes ``num_experts = b_q_weight.size(0)``
+    with no cap, so DeepSeek-V4.1-Flash's 384 routed experts fit one fused
+    decode (48 local with EP8). The specialized ``sm70_nvfp4_moe_decode``
+    kernel is a different format (NVFP4 E4M3 g16 + FP32 global, hidden=2560,
+    512 experts, top-10) and must not be used for V4.1-Flash.
+    """
+    return None
+
+
 def sm70_nvfp4_marlin_process_scales(
     scales: torch.Tensor, activation_dtype: torch.dtype
 ) -> tuple[torch.Tensor, float]:

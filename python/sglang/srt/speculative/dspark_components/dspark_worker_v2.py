@@ -182,6 +182,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        draft_cfg = self.draft_model_runner.model_config.hf_config
+        logger.info(
+            "DSpark launch worker=%s draft_arch=%s n_routed_experts=%s "
+            "num_experts_per_tok=%s kv_dtype=%s sm=%s",
+            type(self).__module__,
+            getattr(draft_cfg, "architectures", [type(self.draft_model).__name__]),
+            getattr(draft_cfg, "n_routed_experts", None),
+            getattr(draft_cfg, "num_experts_per_tok", None),
+            getattr(self.draft_model_runner, "kv_cache_dtype_str", None),
+            (
+                torch.cuda.get_device_capability()[0]
+                if torch.cuda.is_available()
+                else None
+            ),
+        )
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -321,6 +336,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     resolve_req_to_token=lambda: (
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
+                    resolve_attn_backend=lambda: self.draft_model_runner.attn_backend,
                 ),
             )
             self.model_runner.capture_tail_hooks.append(

@@ -188,6 +188,48 @@ def fused_experts_none_to_marlin(
             )
             return StandardCombineInput(hidden_states=output)
 
+    # DeepSeek-V4.1-Flash decode: Marlin's M=1 grouped GEMM is still ~5x
+    # above a bandwidth-bound GEMV. Stream the already-repacked MXFP4
+    # tensors. Prefill M>>4 and every other shape stay on Marlin.
+    from sglang.kernels.ops.moe.sm70_dsv41_mxfp4_moe_decode import (
+        sm70_dsv41_mxfp4_moe_decode,
+        sm70_dsv41_mxfp4_moe_decode_eligible,
+    )
+
+    if sm70_dsv41_mxfp4_moe_decode_eligible(
+        hidden_states,
+        quant_info.w13_qweight,
+        quant_info.w2_qweight,
+        quant_info.w13_scales,
+        quant_info.w2_scales,
+        topk_output.topk_ids,
+        weight_bits=quant_info.weight_bits,
+        w13_qzeros=quant_info.w13_qzeros,
+        w2_qzeros=quant_info.w2_qzeros,
+        w13_global_scale=quant_info.w13_global_scale,
+        w2_global_scale=quant_info.w2_global_scale,
+        w13_bias=quant_info.w13_bias,
+        w2_bias=quant_info.w2_bias,
+        is_gated=runner_config.is_gated,
+        activation=runner_config.activation,
+        gate_up_input_scale=runner_config.gate_up_input_scale,
+        wide_output_scale=runner_config.wide_output_scale,
+        gemm1_alpha=runner_config.gemm1_alpha,
+        gemm1_clamp_limit=runner_config.gemm1_clamp_limit,
+        swiglu_limit=runner_config.swiglu_limit,
+    ):
+        output = sm70_dsv41_mxfp4_moe_decode(
+            hidden_states,
+            quant_info.w13_qweight,
+            quant_info.w2_qweight,
+            quant_info.w13_scales,
+            quant_info.w2_scales,
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            swiglu_limit=runner_config.swiglu_limit,
+        )
+        return StandardCombineInput(hidden_states=output)
+
     if runner_config.is_gated:
         assert runner_config.activation in {
             "silu",
@@ -214,11 +256,13 @@ def fused_experts_none_to_marlin(
         and quant_info.w2_scales.dtype == torch.float8_e8m0fnu
         and hidden_states.dtype == torch.float16
     ):
-        # MXFP4(E8M0) Marlin kernels are only numerically valid on the bf16
-        # activation path. The fp16 + E8M0 path is intentionally not generated
-        # in sgl-kernel, so upcast activations here and cast the result back.
-        marlin_hidden_states = hidden_states.to(torch.bfloat16)
-        marlin_inplace = False
+        # Hopper sgl-kernel never instantiates FP16+E8M0, so upcast to BF16.
+        # SM70 marlin_v100 *does* run FP16+E8M0; a BF16 upcast on V100 is
+        # wrong (no BF16 tensor cores) and would hide the real kernel path.
+        is_sm70 = torch.cuda.get_device_capability(hidden_states.device)[0] == 7
+        if not is_sm70:
+            marlin_hidden_states = hidden_states.to(torch.bfloat16)
+            marlin_inplace = False
 
     output = fused_marlin_moe(
         hidden_states=marlin_hidden_states,

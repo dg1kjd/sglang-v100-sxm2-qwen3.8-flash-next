@@ -479,6 +479,7 @@ class CommitInjectCtx(msgspec.Struct):
     block_pos_offsets: torch.Tensor
     resolve_pool: object
     resolve_req_to_token: object
+    resolve_attn_backend: object
 
 
 class AcceptOuts(msgspec.Struct):
@@ -706,6 +707,7 @@ class DsparkVerifyEpilogue:
                 swa_loc=inject_layout.swa_loc,
                 positions=inject_layout.positions,
                 pool=pool,
+                attn_backend=ctx.resolve_attn_backend(),
             )
 
 

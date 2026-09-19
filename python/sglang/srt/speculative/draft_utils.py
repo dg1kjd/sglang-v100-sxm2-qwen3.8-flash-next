@@ -1,3 +1,6 @@
+from typing import Optional
+
+from sglang.srt.layers.attention.qsa.config import QSA_VARIANT_COMPRESSED, QSAProfile
 from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -7,6 +10,27 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
 )
+
+
+def qsa_draft_extend_graph_backend(attn_backend, topk: int):
+    """Resolve the graph-capable full-attention side of a QSA draft model."""
+
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QwenSparseAttnBackend,
+    )
+
+    # The hybrid wrapper exposes the graph-capable side as
+    # full_attn_backend; a bare backend has no such attribute.
+    backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+    if (
+        topk == 1
+        and isinstance(backend, QwenSparseAttnBackend)
+        and backend.qsa_profile is not None
+        and backend.qsa_profile.variant == QSA_VARIANT_COMPRESSED
+        and backend.qsa_profile.draft_extend_cuda_graph
+    ):
+        return backend
+    return None
 
 
 def _assert_draft_needs_no_conv_sidecar(draft_model_runner) -> None:
@@ -31,11 +55,13 @@ class DraftBackendFactory:
         topk: int,
         speculative_num_steps: int,
         seed_dsa_topk_from_draft_extend: bool = False,
+        qsa_profile: Optional[QSAProfile] = None,
     ):
         self.draft_model_runner = draft_model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.seed_dsa_topk_from_draft_extend = seed_dsa_topk_from_draft_extend
+        self.qsa_profile = qsa_profile
         # The draft runner's own backend, not the process-wide config.
         self.draft_attn_backend = draft_model_runner.draft_attention_backend
 
@@ -81,6 +107,9 @@ class DraftBackendFactory:
         if self.speculative_num_steps <= 1:
             return None
 
+        if self.qsa_profile is not None:
+            return self._create_qwen_qsa_decode_backend()
+
         # Returns a per-step CONTAINER, not an AttentionBackend, so
         # attn_backend_wrapper_for_draft_extend cannot give it a conv sidecar.
         _assert_draft_needs_no_conv_sidecar(self.draft_model_runner)
@@ -98,6 +127,7 @@ class DraftBackendFactory:
             "tilelang_fa_v100": self._create_triton_decode_backend,
             "flash_attn_v100": self._create_triton_decode_backend,
             "intel_amx": self._create_intel_amx_decode_backend,
+            "intel_xpu": self._create_intel_xpu_decode_backend,
             "aiter": self._create_aiter_decode_backend,
             "fa3": self._create_fa3_decode_backend,
             "hybrid_linear_attn": self._create_hybrid_linear_attn_decode_backend,
@@ -145,6 +175,7 @@ class DraftBackendFactory:
             "tilelang_fa_v100": self._create_triton_prefill_backend,
             "flash_attn_v100": self._create_triton_prefill_backend,
             "intel_amx": self._create_intel_amx_prefill_backend,
+            "intel_xpu": self._create_intel_xpu_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
             "hybrid_linear_attn": self._create_hybrid_linear_attn_prefill_backend,
@@ -190,6 +221,11 @@ class DraftBackendFactory:
 
         return is_qwen_qsa(self.draft_model_runner.model_config.hf_config)
 
+    @staticmethod
+    def _stamp_qsa(backend) -> None:
+        backend.prefill_attention_backend_str = "qsa"
+        backend.decode_attention_backend_str = "qsa"
+
     def _create_qwen_qsa_decode_backend(self):
         from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
             QwenSparseMultiStepDraftBackend,
@@ -198,11 +234,9 @@ class DraftBackendFactory:
         backend = QwenSparseMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
-        backend.prefill_attention_backend_str = "qsa"
-        backend.decode_attention_backend_str = "qsa"
+        self._stamp_qsa(backend)
         for child in backend.attn_backends:
-            child.prefill_attention_backend_str = "qsa"
-            child.decode_attention_backend_str = "qsa"
+            self._stamp_qsa(child)
         return backend
 
     def _create_dsa_decode_backend(self):
@@ -293,6 +327,16 @@ class DraftBackendFactory:
         if is_blackwell():
             return self._create_triton_prefill_backend()
         return self._create_fa3_prefill_backend()
+
+    def _create_intel_xpu_decode_backend(self):
+        from sglang.srt.layers.attention.xpu_backend import XPUMultiStepDraftBackend
+
+        return (
+            "intel_xpu",
+            XPUMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            ),
+        )
 
     def _create_aiter_decode_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterMultiStepDraftBackend
@@ -438,8 +482,8 @@ class DraftBackendFactory:
                 DeepseekV4MultiStepBackend,
             )
         else:
-            from sglang.srt.layers.attention.deepseek_v4_backend import (
-                DeepseekV4MultiStepBackend,
+            from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+                create_deepseek_v4_multistep_backend as DeepseekV4MultiStepBackend,
             )
 
         return (
@@ -481,6 +525,14 @@ class DraftBackendFactory:
         from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
 
         return ("intel_amx", IntelAMXAttnBackend(self.draft_model_runner))
+
+    def _create_intel_xpu_prefill_backend(self):
+        from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+        return (
+            "intel_xpu",
+            XPUAttentionBackend(self.draft_model_runner, skip_prefill=False),
+        )
 
     def _create_aiter_prefill_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -578,11 +630,13 @@ class DraftBackendFactory:
                 "dsv4",
                 DeepseekV4HipRadixBackend(self.draft_model_runner, skip_prefill=False),
             )
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            create_deepseek_v4_attn_backend,
         )
 
         return (
             "dsv4",
-            DeepseekV4AttnBackend(self.draft_model_runner, skip_prefill=False),
+            create_deepseek_v4_attn_backend(
+                self.draft_model_runner, skip_prefill=False
+            ),
         )

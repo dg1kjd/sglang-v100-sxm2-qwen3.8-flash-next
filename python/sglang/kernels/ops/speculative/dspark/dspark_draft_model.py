@@ -426,7 +426,10 @@ def commit_kv_proj_fused(
 
     if stacked.fp8_scale is not None:
         quant_method = wkv_linears[0].quant_method
-        kv_all = quant_method.w8a8_block_fp8_linear(
+        w8a8 = getattr(quant_method, "w8a8_block_fp8_linear", None)
+        if not callable(w8a8):
+            return commit_kv_proj(main_x=main_x, wkv_linears=wkv_linears)
+        kv_all = w8a8(
             input=main_x,
             weight=stacked.weight,
             block_size=quant_method.quant_config.weight_block_size,
@@ -461,7 +464,9 @@ def _stacked_wkv_weight(*, wkv_linears: list[torch.nn.Module]) -> _StackedWkvWei
 def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
     quant_method = wkv_linears[0].quant_method
     block_quant = hasattr(quant_method, "block_quant") and quant_method.block_quant
-    if not (block_quant and hasattr(quant_method, "w8a8_block_fp8_linear")):
+    # SM70 MXFP8 leaves w8a8_block_fp8_linear=None (attribute exists).
+    w8a8 = getattr(quant_method, "w8a8_block_fp8_linear", None)
+    if not (block_quant and callable(w8a8)):
         return False
     block_out = quant_method.quant_config.weight_block_size[0]
     return all(

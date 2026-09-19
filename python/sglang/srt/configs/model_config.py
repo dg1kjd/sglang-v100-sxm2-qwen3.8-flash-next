@@ -14,7 +14,6 @@
 
 import copy
 import json
-import copy
 import logging
 import math
 import os
@@ -205,11 +204,21 @@ def is_qwen3_5(config) -> bool:
     )
 
 
+def is_qwen3_5_mtp_draft(config) -> bool:
+    """The Qwen3.5 MoE MTP draft: _config_draft_model rewrites architectures[0] to
+    Qwen3_5ForCausalLMMTP before quantization is resolved."""
+    return (
+        _hf_arch(config) == "Qwen3_5ForCausalLMMTP"
+        and _hf_attr(config, "model_type") == "qwen3_5_moe"
+    )
+
+
 def is_deepseek_v4(config) -> bool:
     return _hf_arch(config) in (
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForCausalLMNextN",
         "DeepseekV4ForCausalLMDSpark",
+        "DeepseekV41ForCausalLM",
     )
 
 
@@ -223,11 +232,8 @@ def is_qwen4_exp(config) -> bool:
 def resolve_spec_hidden_size(
     hf_config, hidden_size: int, hc_mult: int
 ) -> tuple[int, Optional[int]]:
-    # Only DSV4 and Qwen4-Exp carry the hc-flattened stream across the
-    # target->draft boundary; other hc models (hy_v4) collapse to hidden_size
-    # first. Qwen4-Exp's MTP head consumes all hc_mult streams -- its
-    # pre_fc_norm_hidden is sized hc_mult * hidden_size and the draft decode
-    # buffer must match, or graph capture dies on a shape check.
+    # DSV4 and Qwen4-Exp carry the hc-flattened stream across the target->draft
+    # boundary; other hc models (hy_v4) collapse to hidden_size first.
     if hc_mult <= 1 or not (is_deepseek_v4(hf_config) or is_qwen4_exp(hf_config)):
         return hidden_size, None
     hc_hidden_size = hidden_size * hc_mult
@@ -501,12 +507,21 @@ class ModelConfig:
         routed_experts_quant_method = quantization_config.get(
             "routed_experts_quant_method"
         )
-        self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
+        expert_dtype_fp4 = quantization_config.get("expert_dtype") in ("fp4", "mxfp4")
+        self.is_fp4_experts: bool = (
+            routed_experts_quant_method == "mxfp4" or expert_dtype_fp4
+        )
         if self.is_fp4_experts:
             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
 
         # DSV4 mxfp4 layout applies only when the ckpt does not opt in above.
-        if is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None:
+        # Official V4.1-Flash uses expert_dtype=fp4, not routed_experts_quant_method;
+        # do not let shard-header probing overwrite that.
+        if (
+            is_deepseek_v4(self.hf_config)
+            and routed_experts_quant_method is None
+            and not expert_dtype_fp4
+        ):
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
             if (
                 not envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
@@ -524,16 +539,23 @@ class ModelConfig:
             if envs.SGLANG_DSV4_FP4_DEQUANT.get():
                 envs.SGLANG_DSV4_FP4_DEQUANT.set(self.is_fp4_experts is not None)
 
-            # HF config.json inherits topk_group=4 from the V3 template, but
-            # DSV4 trains with no group limiting (sqrtsoftplus + full-expert
-            # top-k). Force topk_group == n_group so deepseek_v2.py:531's
-            # `n_group > topk_group` evaluates False and routes to the
-            # ungrouped sqrtsoftplus path. The grouped impl only supports
-            # sigmoid scoring (topk.py:722) and would silently corrupt expert
-            # weights if hit.
+        # HF config.json inherits topk_group=4 from the V3 template, but
+        # DSV4 trains with no group limiting (sqrtsoftplus + full-expert
+        # top-k). Force topk_group == n_group so deepseek_v2.py:531's
+        # `n_group > topk_group` evaluates False and routes to the
+        # ungrouped sqrtsoftplus path. The grouped impl only supports
+        # sigmoid scoring (topk.py:722) and would silently corrupt expert
+        # weights if hit. Runs for official V4.1-Flash too (expert_dtype=fp4).
+        if is_deepseek_v4(self.hf_config):
             n_group = getattr(self.hf_config, "n_group", None)
             if n_group is not None:
                 self.hf_config.topk_group = n_group
+            logger.info(
+                "DSV4 routing: n_group=%s topk_group=%s scoring_func=%s",
+                getattr(self.hf_config, "n_group", None),
+                getattr(self.hf_config, "topk_group", None),
+                getattr(self.hf_config, "scoring_func", None),
+            )
 
         # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None
@@ -577,12 +599,17 @@ class ModelConfig:
                 or hasattr(self.hf_config, "audio_config")
             )
         )
+        has_dsv41_vision = (
+            self.hf_config.model_type == "deepseek_v41"
+            and getattr(self.hf_config, "vision_n_layers", 0) > 0
+        )
         self.is_multimodal = (
             enable_multimodal
             and not self.is_lm_only
             and (
                 is_multimodal_model(self.hf_config.architectures)
                 or has_multimodal_subconfig
+                or has_dsv41_vision
             )
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
@@ -601,6 +628,8 @@ class ModelConfig:
             self.is_multimodal
             and getattr(self.hf_config, "vision_config", None) is not None
         )
+        if self.is_multimodal and has_dsv41_vision:
+            self.is_image_understandable_model = True
 
         # Models expose audio_config at different nesting levels:
         #   - top-level audio_config: e.g. Qwen2Audio
@@ -630,6 +659,7 @@ class ModelConfig:
             self.hf_config.architectures
         )
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        self.engram_ngram_size = engram_ngram_size(self.hf_config)
         # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
@@ -779,6 +809,36 @@ class ModelConfig:
                     "Draft checkpoint bundles a DSpark head; loading draft arch "
                     "DeepseekV4ForCausalLMDSpark."
                 )
+                n_dspark = getattr(
+                    self.hf_text_config, "dspark_n_routed_experts", None
+                )
+                topk = getattr(
+                    self.hf_text_config, "dspark_num_experts_per_tok", None
+                )
+                if n_dspark is None:
+                    raise ValueError(
+                        "DSpark draft checkpoint is missing dspark_n_routed_experts; "
+                        "refusing to build a 384-expert target MoE as the drafter."
+                    )
+                n_dspark = int(n_dspark)
+                old_n = getattr(self.hf_text_config, "n_routed_experts", None)
+                self.hf_config.n_routed_experts = n_dspark
+                self.hf_text_config.n_routed_experts = n_dspark
+                if topk is not None:
+                    topk = int(topk)
+                    self.hf_config.num_experts_per_tok = topk
+                    self.hf_text_config.num_experts_per_tok = topk
+                logger.info(
+                    "DSpark draft n_routed_experts %s -> %s, num_experts_per_tok %s",
+                    old_n,
+                    n_dspark,
+                    getattr(self.hf_text_config, "num_experts_per_tok", None),
+                )
+                if n_dspark != 128:
+                    raise ValueError(
+                        "DSpark mtp.* expert count must be 128 on this V100 path, "
+                        f"got dspark_n_routed_experts={n_dspark}."
+                    )
             else:
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
                 self.hf_config.num_nextn_predict_layers = 1
@@ -858,9 +918,8 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen4ExpForCausalLMMTP"
             text_config = self.hf_text_config
             text_config.num_nextn_predict_layers = 1
-            # Collapse to a single full_attention layer so the draft's
-            # full_attention_layer_ids is [0]. Qwen4ExpTextConfig.layers_block_type
-            # bypasses num_hidden_layers when layer_types is set.
+            # layers_block_type follows layer_types, not num_hidden_layers,
+            # so both must shrink for the draft's full_attention_layer_ids to be [0].
             text_config.num_hidden_layers = 1
             text_config.layer_types = ["full_attention"]
             text_config.full_attention_interval = 1
@@ -895,6 +954,14 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "NemotronH_Omni_Reasoning_V3"
+        ):
+            self.hf_config = self.hf_text_config
+            self.hf_config.architectures = ["NemotronHForCausalLMMTP"]
             self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] in [
@@ -1662,7 +1729,6 @@ class ModelConfig:
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
-            "gptq",
             "fp8",
             "compressed_tensors",
             "compressed-tensors",
@@ -1778,9 +1844,16 @@ class ModelConfig:
                         f"Using CLI-specified quantization ({self.quantization}) which is "
                         f"compatible with HF config quant_method ({quant_method})."
                     )
-                elif self.is_draft_model:
+                elif self.is_draft_model and not (
+                    self.is_draft_quantization_explicit
+                    and self.quantization in REQUANTIZATION_METHODS
+                    and is_hip()
+                    and is_qwen3_5_mtp_draft(self.hf_config)
+                ):
                     # Allow auto-detection of quantization from checkpoint for draft model
-                    # only if the CLI quantization is not compatible
+                    # only if the CLI quantization is not compatible. An explicit
+                    # online-requantization request for the draft (e.g. quark_mxfp4
+                    # for an MTP stack the checkpoint left in bf16) is honored below.
                     logger.info(
                         f"Draft model quantization ({quant_method}) differs from "
                         f"main model quantization ({self.quantization}). "
@@ -2076,6 +2149,7 @@ multimodal_model_archs = [
     "MossVLForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "NemotronH_Nano_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3",
     "MuseGlimmerForConditionalGeneration",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
@@ -2085,6 +2159,7 @@ multimodal_model_archs = [
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
@@ -2136,17 +2211,20 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 ]
 
 # Multimodal archs whose LM prefill is validated under breakable CUDA graph;
-# embed-carrying batches are rejected at replay (can_run_graph) and run eager.
+# replay eligibility for embed-carrying batches is checked by can_run_graph.
 # The Kimi archs are structurally multimodal -- their configs always carry a
 # vision_config, so is_multimodal is True even for text-only serving -- and the
 # generic multimodal rule disabled prefill CG for them despite the LM prefill
 # capturing cleanly.
 multimodal_breakable_cuda_graph_supported_model_archs = [
     "Cohere2VisionForConditionalGeneration",
+    "Glm5NextForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    # Qwen4-Exp is intentionally absent: QSA builds host-side sparse metadata
+    # per forward and cannot serve the breakable prefill capture.
     "MuseGlimmerForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
@@ -2432,3 +2510,9 @@ def get_hybrid_layer_ids(
         swa_attention_layer_ids = None
         full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
+
+
+def engram_ngram_size(hf_config) -> int:
+    if getattr(hf_config, "engram_layer_ids", ()):
+        return hf_config.engram_max_ngram_size
+    return 0

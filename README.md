@@ -2,9 +2,11 @@
 
 # SGLang&nbsp;V100
 
-*"Cool-kids-on-steroids"-Release ;)*
+*"Cool-kids-on-more-steroids"-Release ;)*
 
 **Qwen3.8-Flash-Next at full 262K context on 4× NVIDIA V100 SXM2.**
+
+Initial **DeepSeek-V4.1-Flash** serve on 8× V100 (DSpark, 256k).
 
 A Volta (sm70) port of [SGLang](https://github.com/sgl-project/sglang).
 
@@ -23,6 +25,12 @@ This fork closes that gap. It serves **Qwen3.8-Flash-Next** — 125B MoE with a
 a built-in MTP draft head and a vision tower — on four 32 GB V100s, at the
 model's native 262,144-token context, with NVFP4 weights and an FP16 KV cache.
 
+It also has an **initial** serve path for official
+**DeepSeek-V4.1-Flash** (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
+on eight 32 GB V100s: CSA2 sparse attention, host Engram, MXFP4 expert spill,
+and the checkpoint's own DSpark draft. That recipe is new and not soaked the
+way Qwen is — see [DeepSeek-V4.1-Flash](#deepseek-v41-flash).
+
 If you have V100s sitting idle because modern inference stacks abandoned them,
 this makes them useful again for frontier-class long-context agentic work.
 
@@ -37,29 +45,29 @@ different:
 
 | workload | decode (tok/s) | MTP accept len |
 |---|---|---|
-| Coding problems — 8× HumanEval, the 1Cat-vLLM comparison | **156.6** (median, 150–160) | 3.90 |
-| Agentic long context — 7,413-token prompt, one stream | **127** | ~3.3 |
+| Coding problems — 8× HumanEval, the 1Cat-vLLM comparison | **167.7** (median, 153–177) | 3.57 |
+| Agentic long context — 7,405-token prompt, one stream | **138** | 3.0 |
 
-Agentic decode under concurrency — per-stream median over 194–289 requests in a
-~1-hour sustained load:
+Agentic decode under concurrency — per-stream median over 8 requests at each
+concurrency (live `--max-running-requests 3`):
 
 | concurrency | generation (tok/s, per stream) | time to first token |
 |---|---|---|
-| 1 | **127** | 2.96 s |
-| 2 | **78.9** | 4.74 s |
-| 4 | **54.0** | 8.70 s |
+| 1 | **138** | 1.95 s |
+| 2 | **80.3** | 3.03 s |
+| 3 | **64.3** | 2.96 s |
 
 Per-stream is what a single request sees; aggregate still climbs with
-concurrency (four streams ≈ 216 tok/s combined).
+concurrency (three streams ≈ 193 tok/s combined).
 
 **Prefill** scales with prompt length — fixed per-request overhead dominates
 short prompts and amortises over long ones:
 
 | prompt tokens | 375 | 1,473 | 2,936 | 5,862 | 11,714 | 23,417 |
 |---|---|---|---|---|---|---|
-| prefill tok/s | 283 | 986 | 1,746 | 2,395 | 2,888 | 3,092 |
+| prefill tok/s | 1,394 | 1,418 | 2,488 | 3,451 | 3,258 | 3,266 |
 
-The 7,413-token agentic prompt prefills at ~2,560 tok/s (≈2.9 s cold). The
+The 7,405-token agentic prompt prefills at ~3,060 tok/s (≈2.4 s cold). The
 262K context is real: a ~131,500-token prompt prefills in ~48 s (~2,700 tok/s).
 Idle cost is ~4% CPU per rank and 0% GPU — the scheduler blocks on a poller
 rather than spinning.
@@ -142,11 +150,17 @@ bash scripts/serve_qwen38_flash_next_nvfp4_v100.sh target
 
 # Same, plus the built-in MTP draft head (recommended)
 bash scripts/serve_qwen38_flash_next_nvfp4_v100.sh mtp
+
+# DeepSeek-V4.1-Flash (initial, 8×V100) — see recipe below
+bash scripts/serve_dsv41_v100.sh
 ```
 
-The launcher carries the tuned flag set and, more usefully, the *reasons* for
-each OOM-sensitive value in its comments. Read it before changing
+The Qwen launcher carries the tuned flag set and, more usefully, the *reasons*
+for each OOM-sensitive value in its comments. Read it before changing
 `--mem-fraction-static`, `--max-prefill-tokens` or `--hicache-size`.
+On V100 (`--dtype float16`) it also passes `--ple-offload-embedding`, so the
+51 GB PLE n-gram table lands in host memory. Without that offload the table
+is created on GPU and OOMs at load.
 
 ### Talking to it
 
@@ -169,12 +183,132 @@ Image input works on both. Note that this model emits reasoning: an empty
 while still inside a thinking block — raise the limit rather than reading it as
 a failure.
 
+## DeepSeek-V4.1-Flash
+
+Initial attempt: official `deepseek-ai/DeepSeek-V4.1-Flash` on **8×**
+V100-SXM2-32GB (TP=8 / EP=8). Different box shape than Qwen (four cards is not
+enough). Host Engram (~189 GiB) plus pinned expert spill need a large RAM node
+next to the GPUs and **1G hugepages** on that NUMA node; see
+`scripts/serve_dsv41_v100.sh` and [docs/v100/INSTALL.md](docs/v100/INSTALL.md).
+
+### Get the model
+
+Use the official DeepSeek mixed-quant checkpoint — not a third-party NVFP4 /
+GPTQ / AWQ re-quant, and not DeepSeek-V4-Flash (that is a different
+architecture). Dense weights are block FP8 (`quant_method: fp8`, 32×32
+`ue8m0`); routed experts are native FP4 (`expert_dtype: fp4`, MXFP4). The
+DSpark draft lives in the same repo. Runtime on this port is FP16 activations
+and an FP8-E4M3 KV cache; do not unpack the dense MXFP8 to FP16 on 32 GB.
+
+Weights: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash
+
+```bash
+pip install -U "huggingface_hub[cli]"
+hf download deepseek-ai/DeepSeek-V4.1-Flash \
+  --local-dir ~/models/DeepSeek-V4.1-Flash
+
+export MODEL_PATH=~/models/DeepSeek-V4.1-Flash
+```
+
+~476 GB (48 shards). The export is multimodal; this recipe serves it with
+`--language-model-only`. The model is MIT-licensed; satisfy that independently.
+
+| | |
+|---|---|
+| checkpoint | https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash |
+| quantisation | native mixed: MXFP8 dense (e4m3 + UE8M0, 32×32) + MXFP4 routed experts |
+| do not use | https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash , https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731 , https://huggingface.co/nvidia/DeepSeek-V4-Flash-nvfp4-DSpark (V4-Flash NVFP4, not V4.1) |
+
+Measured on that 8-card recipe (DSpark on, sticky last-seq, advertised 256k
+context, `np=1`). Coding and short-prompt checks at temperature 0; 8k prefill
+with `max_new_tokens=1`:
+
+| workload | result |
+|---|---|
+| `17*19` / `is_palindrome` | correct |
+| coding-1 (`merge_sorted`, 101 tok) | **8.14 tok/s** |
+| 8k prefill | **7.98 s / 1026 tok/s** |
+
+Open-ended chat at temperature 1 is closer to **3 tok/s** (DSpark accept ~2).
+Temperature 0 is right for code and wrong for long prose: greedy can lock onto
+a short cycle and the target will keep signing it. Use `temperature=1`,
+`top_p=0.95` for chat. Do not call `/health` (it drops the sticky pin).
+
+### Reference recipe
+
+The wrapper is the supported entry. It exports the env knobs that are not CLI
+flags, then launches the server.
+
+```bash
+export MODEL_PATH=~/models/DeepSeek-V4.1-Flash
+export SGLANG_DSV41_DSPARK=1
+export SGLANG_DSV41_STICKY_LAST_SEQ=1
+export SGLANG_DSV41_CONTEXT_LEN=262144
+bash scripts/serve_dsv41_v100.sh
+```
+
+Expanded (what the script actually runs when DSpark is on). Do not drop the
+env block — spill, Engram, and sticky are not implied by the CLI flags.
+
+```bash
+export SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1
+export SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=private
+export SGLANG_DSV41_EXPERT_SPILL_APPLY=1
+export SGLANG_DSV41_EXPERT_SPILL_GB=13
+export SGLANG_DSV41_SPILL_LANDING=36
+export SGLANG_DSV41_STICKY_LAST_SEQ=1
+export NCCL_ALGO=allreduce:tree
+export NCCL_BUFFSIZE=2097152
+export NCCL_MIN_NCHANNELS=1
+export NCCL_MAX_NCHANNELS=4
+
+python -m sglang.launch_server \
+  --model-path "${MODEL_PATH}" \
+  --tp 8 --ep-size 8 \
+  --dtype float16 \
+  --moe-runner-backend marlin \
+  --attention-backend dsv4 \
+  --context-length 262144 \
+  --chunked-prefill-size 2048 \
+  --mem-fraction-static 0.88 \
+  --max-running-requests 1 \
+  --max-total-tokens 262144 \
+  --max-prefill-tokens 262144 \
+  --pre-warm-nccl \
+  --disable-prefill-cuda-graph \
+  --cuda-graph-max-bs-decode 1 \
+  --disable-radix-cache \
+  --language-model-only \
+  --reasoning-parser deepseek-v41 \
+  --tool-call-parser deepseekv41 \
+  --trust-remote-code \
+  --disable-custom-all-reduce \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path "${MODEL_PATH}" \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+| knob | ship value | why |
+|---|---|---|
+| DSpark | on (`γ=5` from the checkpoint) | Best measured TG on this box. `SGLANG_DSV41_DSPARK=0` is greedy Tree |
+| sticky last-seq | on | Exact full-history continuation only. Radix stays off (CSA2 rings desync on a prefix hit) |
+| context / max tokens | 262144 | Advertised window. 8k prefill is what has been smoked; 512k has not left ~300 MiB for the Engram MXFP8 unpack |
+| `--mem-fraction-static` | 0.88 | 0.99 OOMs the Engram unpack on T=6 verify capture / 8k prefill |
+| expert spill | 13 GiB/rank (landing 36) | Spill 12 left 8k ~8 MiB short of that unpack |
+| `--max-running-requests` | 1 | DSpark would otherwise inflate this |
+| `--chunked-prefill-size` | 2048 | Vestigial SWA floor is sized for this chunk |
+
+Do not tune `--speculative-dspark-block-size`. Checkpoint weights stay mixed
+MXFP4 experts + packed MXFP8 dense; do not unpack dense to FP16 on 32 GB.
+
 ## What the port adds
 
 None of this exists upstream. **The Volta port itself is the work of
-[haohervchb](https://github.com/haohervchb/sglang-V100)** — the sm70 kernels, the model support and the serving
-recipe below are all theirs. This repository re-lands that work onto a much
-newer SGLang and fixes what the move broke; see
+[haohervchb](https://github.com/haohervchb/sglang-V100)** — the sm70 kernels, the
+Qwen3.8 model support and that serving recipe are all theirs. This repository
+re-lands that work onto a much newer SGLang, fixes what the move broke, and
+adds the DeepSeek-V4.1-Flash path; see
 [Relationship to upstream](#relationship-to-upstream).
 
 - **NVFP4 W4A16 on sm70** — a JIT CUDA path for FP4 weights on hardware with no
@@ -200,8 +334,11 @@ newer SGLang and fixes what the move broke; see
 
 Stated plainly, because the alternative is you finding them at 3am:
 
-- **Only Qwen3.8-Flash-Next is validated.** Other architectures may load; none
-  are tested here, and several upstream model paths assume sm80+ kernels.
+- **Qwen3.8-Flash-Next is the soaked model.** DeepSeek-V4.1-Flash has an
+  initial 8×V100 recipe (8k prefill + coding smoke). It is not a multi-hour
+  soak, leftover HBM after an 8k prompt is tight (~0.5 GiB), and open-ended
+  greedy (temperature 0) can loop. Other architectures may load; several
+  upstream model paths still assume sm80+ kernels.
 - **`multimodal_gen` (diffusion / video generation) is not ported.** It carries
   upstream's code, not this fork's Volta adaptations. The Qwen3.8 *vision tower*
   is fully working — that is a different subsystem.
@@ -231,7 +368,8 @@ repository re-lands it onto upstream `main` as of 2026-09-02 (`99b910955`),
 about 4,250 commits later. Upstream's engine
 — including the unified radix cache, the hierarchical KV cache and the
 speculative decoding stack — is used as-is wherever possible; this fork adds the
-sm70 layer and the Qwen3.8-Flash-Next model support on top.
+sm70 layer, Qwen3.8-Flash-Next, and an initial DeepSeek-V4.1-Flash serve path
+on top.
 
 This is not a pure 3-way merge between the two upstream repos. Beyond re-landing
 the port, the tree carries hand-crafted optimizations and bug fixes, and it is

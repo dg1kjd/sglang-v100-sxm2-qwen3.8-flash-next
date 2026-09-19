@@ -9,7 +9,9 @@ import warnings
 from contextlib import ExitStack
 
 from sglang.srt.environ import _DEPRECATED_ENVS, _DeprecatedEnv, envs
+from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -161,6 +163,48 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
 
         self._apply(old_name, _DEPRECATED_ENVS[old_name])
         self.assertEqual(envs.SGLANG_REQ_WAITING_TIMEOUT.get(), 1.5)
+
+
+class TestDsv41EngramHostTableDefault(CustomTestCase):
+    def setUp(self):
+        envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.clear()
+        self.addCleanup(envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.clear)
+
+    def test_default_true_on_sm70(self):
+        with override_platform(
+            is_cuda=True,
+            is_hip=False,
+            is_sm70=True,
+            is_sm90=False,
+            is_sm100=False,
+            is_sm120=False,
+        ):
+            self.assertTrue(envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get())
+
+    def test_default_false_on_hopper(self):
+        with override_platform(
+            is_cuda=True,
+            is_hip=False,
+            is_sm70=True,
+            is_sm90=True,
+            is_sm100=False,
+            is_sm120=False,
+        ):
+            self.assertFalse(envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get())
+
+    def test_explicit_false_wins_on_sm70(self):
+        with (
+            override_platform(
+                is_cuda=True,
+                is_hip=False,
+                is_sm70=True,
+                is_sm90=False,
+                is_sm100=False,
+                is_sm120=False,
+            ),
+            envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.override(False),
+        ):
+            self.assertFalse(envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get())
 
 
 if __name__ == "__main__":

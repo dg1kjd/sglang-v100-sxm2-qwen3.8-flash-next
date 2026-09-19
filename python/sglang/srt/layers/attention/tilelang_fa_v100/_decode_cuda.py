@@ -19,6 +19,7 @@ from pathlib import Path
 
 import torch
 from sglang.kernels.sm70_paths import sm70_csrc
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +211,23 @@ def sm70_cuda_qsa_decode(
         partial_o,
         partial_lse,
     )
+    if (
+        1 <= batch <= 4
+        and heads == 6
+        and dim == 256
+        and max_splits <= 160
+        and torch.cuda.get_device_capability(q.device) == (7, 0)
+        and envs.SGLANG_SM70_QSA_COMBINE.get()
+    ):
+        from sglang.kernels.ops.attention.sm70_qsa_combine import combine
+
+        return combine(
+            partial_o,
+            partial_lse,
+            seq_lens,
+            indices.shape[1],
+            QSA_DECODE_TOKENS_PER_SPLIT,
+        )
     from ._kernels_paged_decode import _decode_combine_kernel
 
     combine = _decode_combine_kernel(

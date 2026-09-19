@@ -76,8 +76,8 @@ from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
-    is_cp_v2_active,
-    is_mla_prefill_cp_enabled,
+    is_cp_active,
+    is_mla_cp_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import create_sampler
@@ -193,7 +193,6 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
     ServerArgs,
     add_chunked_prefix_cache_attention_backend,
-    get_global_server_args,
 )
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
@@ -226,7 +225,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import cuda_nvtx_range, profile_range
 from sglang.srt.utils.offloader import (
     create_offloader,
     get_offloader,
@@ -266,8 +265,8 @@ def _prefill_cuda_graph_allows_context_parallel(
 ) -> bool:
     """Allow CP only through a runner that captured the validated CP body."""
     return get_cp_strategy() is None or (
-        bool(getattr(prefill_runner, "enable_cp_v2_bcg_capture", False))
-        and is_cp_v2_active(forward_batch)
+        bool(getattr(prefill_runner, "enable_cp_bcg_capture", False))
+        and is_cp_active(forward_batch)
     )
 
 
@@ -927,6 +926,10 @@ class ModelRunner:
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
 
+        init_engram = getattr(self.model, "init_engram_history", None)
+        if callable(init_engram):
+            init_engram(self.req_to_token_pool.size, self.device)
+
         self.maybe_init_hisparse_coordinator()
 
         self.init_routed_experts_capturer()
@@ -967,8 +970,8 @@ class ModelRunner:
             ),
         )
 
-    def post_capture_resize_kv_pool(self):
-        resize = compute_post_capture_kv_resize(self)
+    def post_capture_resize_kv_pool(self, *, draft_runners=()):
+        resize = compute_post_capture_kv_resize(self, draft_runners=draft_runners)
         self.max_total_num_tokens = resize.max_total_num_tokens
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = resize.full_max_total_num_tokens
@@ -1082,6 +1085,19 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        # from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        # if get_moe_runner_backend().is_flashinfer_megamoe():
+        #     # Warmup's dummy batches aren't guaranteed to route through every
+        #     # MoE layer; a layer that first builds mid-capture instead of
+        #     # during warmup hits a hard RuntimeError (capture forbids the
+        #     # lazy build's blocking device sync). Force every layer to build
+        #     # here, eagerly, outside any graph.
+        #     from sglang.srt.layers.moe.flashinfer_megamoe import (
+        #         warmup_all_flashinfer_megamoe_layers,
+        #     )
+
+        #     warmup_all_flashinfer_megamoe_layers(self.model)
         capture = capture_cuda_graphs(
             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
         )
@@ -1402,6 +1418,25 @@ class ModelRunner:
 
     def configure_kv_cache_dtype(self):
         spec_algorithm = getattr(self, "spec_algorithm", None)
+        draft_kv = get_spec().speculative_draft_kv_cache_dtype
+        # SM70 DSpark: DSV4 SWA is packed FP8 in uint8 (same as the target).
+        # Forcing auto/FP16 trips create_buffer's store_dtype==uint8 assert.
+        if (
+            getattr(self, "is_draft_worker", False)
+            and spec_algorithm is not None
+            and spec_algorithm.is_dspark()
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] == 7
+        ):
+            if draft_kv not in (None, "fp8_e4m3"):
+                logger.warning(
+                    "SM70 DSpark draft KV dtype %r ignored; DSV4 pool needs packed fp8_e4m3",
+                    draft_kv,
+                )
+            draft_kv = None
+            logger.info(
+                "SM70 DSpark draft KV cache dtype=fp8_e4m3 (DSV4 packed uint8 pool)"
+            )
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=get_model().kv_cache_dtype,
@@ -1414,7 +1449,7 @@ class ModelRunner:
                     else False
                 ),
                 speculative_draft_attention_backend=self.draft_attention_backend,
-                speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+                speculative_draft_kv_cache_dtype=draft_kv,
             )
         )
         # This runner's OWN resolved dtype string (target or draft). Attention
@@ -1509,6 +1544,10 @@ class ModelRunner:
 
     def prepare_dummy_forward_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
         """Customize a runner-created dummy batch before attention metadata initialization."""
+        # Dummy runs bypass the MLP-sync/scatter passes that stamp real batches.
+        forward_batch.attn_tp_sequence_sharded = self.attn_tp_sequence_sharded(
+            forward_batch._forward_num_tokens()
+        )
         return forward_batch
 
     def attn_tp_sequence_sharded(self, num_tokens: int) -> bool:
@@ -1544,7 +1583,7 @@ class ModelRunner:
                 sharded=(
                     forward_batch.attn_tp_sequence_sharded
                     and not is_dsa_enable_prefill_cp()
-                    and not is_mla_prefill_cp_enabled()
+                    and not is_mla_cp_enabled()
                 ),
             )
 
@@ -1630,6 +1669,11 @@ class ModelRunner:
 
         # Step span
         step_span_ctx = profile_range(build_step_span_name(forward_batch))
+        verify_nvtx = (
+            cuda_nvtx_range("dsv41_target_verify")
+            if forward_batch.forward_mode.is_target_verify()
+            else contextlib.nullcontext()
+        )
 
         canary_ctx = (
             context_tuple(
@@ -1646,6 +1690,7 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            verify_nvtx,
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
@@ -1895,6 +1940,24 @@ class ModelRunner:
         # LogitsProcessorOutput is normally invocation-scoped, but CUDA graph
         # runners may reuse backing objects. Never leak an auxiliary result from
         # a previous replay into a request with no observer state.
+        if envs.SGLANG_DSV41_PREFILL_SYNC.get():
+            lg = getattr(logits_output, "next_token_logits", None)
+            logger.info(
+                "DSV41 sample enter logits=%s",
+                None if lg is None else tuple(lg.shape),
+            )
+            if torch.is_tensor(lg) and lg.numel():
+                logger.info(
+                    "DSV41 sample enter finite=%s/%s peek=%s",
+                    int(torch.isfinite(lg).sum().item()),
+                    lg.numel(),
+                    float(lg.reshape(-1)[0].item()),
+                )
+            torch.cuda.synchronize()
+            idx = torch.zeros(1, device="cuda", dtype=torch.int64)
+            torch.zeros(1, device="cuda")[idx]
+            torch.cuda.synchronize()
+            logger.info("DSV41 sample enter ok")
         logits_output.auxiliary_device_output = None
         observer = self.sampling_observer
         # Preserve two-argument overrides when observation is inactive.
@@ -1908,6 +1971,13 @@ class ModelRunner:
             observer_state = self._preprocess_logits(
                 logits_output, forward_batch.sampling_info
             )
+
+        if envs.SGLANG_DSV41_PREFILL_SYNC.get():
+            torch.cuda.synchronize()
+            idx = torch.zeros(1, device="cuda", dtype=torch.int64)
+            torch.zeros(1, device="cuda")[idx]
+            torch.cuda.synchronize()
+            logger.info("DSV41 sample after preprocess ok")
 
         # Sample the next tokens
         next_token_ids = self.sampler(
@@ -1923,6 +1993,15 @@ class ModelRunner:
                 else forward_batch.seq_lens - 1
             ),
         )
+        if envs.SGLANG_DSV41_PREFILL_SYNC.get():
+            torch.cuda.synchronize()
+            idx = torch.zeros(1, device="cuda", dtype=torch.int64)
+            torch.zeros(1, device="cuda")[idx]
+            torch.cuda.synchronize()
+            tok = None
+            if torch.is_tensor(next_token_ids) and next_token_ids.numel():
+                tok = int(next_token_ids.reshape(-1)[0].item())
+            logger.info("DSV41 sample done token=%s", tok)
         if observer_state is not None:
             logits_output.auxiliary_device_output = observer.after_sample(
                 observer_state,

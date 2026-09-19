@@ -22,12 +22,16 @@ tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
 
+import dataclasses
+import logging
 import threading
 import warnings
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
 
 import torch
+
+from sglang.srt.environ import envs
 
 try:
     from cuda.bindings import runtime as rt
@@ -40,6 +44,15 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_ut
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
 
 _is_xpu = is_xpu()
+logger = logging.getLogger(__name__)
+
+
+def _dsv41_flush_index_assert() -> None:
+    """Eager aten::index so a captured IndexKernel OOB prints on this sync."""
+    idx = torch.zeros(1, device="cuda", dtype=torch.int64)
+    torch.zeros(1, device="cuda")[idx]
+    torch.cuda.synchronize()
+
 
 __all__ = [
     "eager_on_graph",
@@ -195,6 +208,19 @@ def _copy_output(dst: Any, src: Any) -> Any:
         copied = [_copy_output(d, s) for d, s in zip(dst, src)]
         return tuple(copied) if isinstance(dst, tuple) else copied
 
+    if dataclasses.is_dataclass(dst) and dataclasses.is_dataclass(src) and type(dst) is type(src):
+        for field in dataclasses.fields(src):
+            src_val = getattr(src, field.name)
+            dst_val = getattr(dst, field.name, None)
+            if torch.is_tensor(dst_val) and torch.is_tensor(src_val):
+                if dst_val.shape == src_val.shape and dst_val.dtype == src_val.dtype:
+                    dst_val.copy_(src_val)
+                else:
+                    setattr(dst, field.name, src_val)
+            else:
+                setattr(dst, field.name, src_val)
+        return dst
+
     if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
         for key, src_val in src.__dict__.items():
             dst_val = getattr(dst, key, None)
@@ -224,6 +250,11 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
         def wrapper(*args, **kwargs):
             capture = _current_capture_var.get()
             if capture is None:
+                return inner(*args, **kwargs)
+            # Nested wrap (e.g. LRU ensure inside an eager mlp break): already
+            # between segments, so just run. Recording a second break here
+            # hits ``_end_current_segment`` with ``_current_graph is None``.
+            if capture._current_graph is None:
                 return inner(*args, **kwargs)
 
             # End the segment that captured up to this break point.
@@ -259,7 +290,11 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
 
             def replay_fn():
                 new_out = captured_inner(*captured_args, **captured_kwargs)
-                return _copy_output(captured_output, new_out)
+                _copy_output(captured_output, new_out)
+                # Return the live eager output. captured_output may be a
+                # graph-pool alias from capture; callers that leave the
+                # graph-pool replay scope must not use those addresses.
+                return new_out
 
             capture.cuda_graph._break_fns.append(replay_fn)
 
@@ -281,14 +316,31 @@ class BreakableCUDAGraph:
         self._break_fns: list[Callable[[], Any]] = []
         self._deduped_cuda_graph = deduped_cuda_graph
 
-    def replay(self) -> None:
+    def replay(self) -> Any:
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
+        sync = envs.SGLANG_DSV41_PREFILL_SYNC.get()
+        last_break_out: Any = None
         try:
             for i, seg in enumerate(self._segments):
+                if sync:
+                    torch.cuda.synchronize()
                 seg.replay()
+                if sync:
+                    torch.cuda.synchronize()
+                    # Device-side IndexKernel asserts inside a CUDA graph stay
+                    # silent through fill_/sync. An eager aten::index flushes them.
+                    _dsv41_flush_index_assert()
                 if i < len(self._break_fns):
-                    self._break_fns[i]()
+                    break_out = self._break_fns[i]()
+                    if break_out is not None:
+                        last_break_out = break_out
+                    if sync:
+                        torch.cuda.synchronize()
+                        _dsv41_flush_index_assert()
+            if sync:
+                _dsv41_flush_index_assert()
+            return last_break_out
         finally:
             _current_stream_var.reset(token)
 
