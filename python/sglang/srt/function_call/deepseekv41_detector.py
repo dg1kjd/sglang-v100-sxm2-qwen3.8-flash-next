@@ -1,6 +1,5 @@
 import re
 from typing import List, Literal, Optional, Union
-
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import StructuralTag
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
@@ -10,6 +9,7 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
     """DeepSeek V4.1 DSML detector.
 
     Tag names have a leading space: " calls", " invoke", and " parameter".
+    The leading space in each tag name below is intentional, not a typo.
     """
 
     tool_calls_block_name = " calls"
@@ -99,7 +99,9 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
         tools = list(tools or [])
         if isinstance(tool_choice, ToolChoice):
             tools = [
-                tool for tool in tools if tool.function.name == tool_choice.function.name
+                tool
+                for tool in tools
+                if tool.function.name == tool_choice.function.name
             ]
             if len(tools) != 1:
                 return None

@@ -159,3 +159,27 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+@warmup("dsv41_chunk")
+async def dsv41_chunk(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """One chunked-prefill-sized extend so SM70 DSV41 hits the Engram unpack /
+    CSA2 extend shape of a long prompt's first chunk before serving."""
+    chunk = getattr(tokenizer_manager.server_args, "chunked_prefill_size", None)
+    if not chunk or chunk <= 0:
+        chunk = 2048
+    generate_req_input = GenerateReqInput(
+        input_ids=np.random.randint(1, 1024, size=[int(chunk)]).tolist(),
+        sampling_params={
+            "max_new_tokens": 1,
+            "temperature": 0.0,
+        },
+    )
+    if disaggregation_mode != "null":
+        generate_req_input.bootstrap_room = 0
+        generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+    async for _ in tokenizer_manager.generate_request(generate_req_input, None):
+        pass

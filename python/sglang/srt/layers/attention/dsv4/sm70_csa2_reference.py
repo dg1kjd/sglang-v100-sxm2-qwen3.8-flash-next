@@ -682,6 +682,46 @@ def topk_positions(
 # --------------------------------------------------------------------------- #
 
 
+@dataclass
+class SparseSoftmaxTerms:
+    """fp32 online-softmax intermediates shared by the output and the mass split.
+
+    ``p`` / ``sink_p`` are unnormalized ``exp(· - m)``. Mass of a key is
+    ``p / l``; mass of the sink is ``sink_p / l``. A row with no valid key has
+    ``has_key`` False and must not be read as a mass (``l`` overflows).
+    """
+
+    scores: torch.Tensor  # [T, H, K]
+    m: torch.Tensor  # [T, H, 1]
+    p: torch.Tensor  # [T, H, K]
+    sink_p: torch.Tensor  # [T, H, 1]
+    l: torch.Tensor  # [T, H, 1]
+    has_key: torch.Tensor  # [T, 1, 1] bool
+
+
+def sparse_softmax_terms(
+    q: torch.Tensor,
+    keys: torch.Tensor,
+    valid: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+) -> SparseSoftmaxTerms:
+    """The sink-aware softmax used by ``sparse_attention_rows``.
+
+    Isolated so a testbench can read sink / window / sparse mass without
+    reimplementing the serving formula.
+    """
+    s = torch.einsum("thd,tkd->thk", q.float(), keys.float()) * softmax_scale
+    s = s.masked_fill(~valid[:, None, :], -torch.inf)
+    m = s.amax(dim=-1, keepdim=True)
+    has_key = valid.any(dim=-1)[:, None, None]
+    m = torch.where(has_key, m, torch.full_like(m, -1e30))
+    p = torch.exp(s - m)
+    sink_p = torch.exp(attn_sink.float()[None, :, None] - m)
+    l = p.sum(dim=-1, keepdim=True) + sink_p
+    return SparseSoftmaxTerms(s, m, p, sink_p, l, has_key)
+
+
 def sparse_attention_rows(
     q: torch.Tensor,
     keys: torch.Tensor,
@@ -699,15 +739,95 @@ def sparse_attention_rows(
     HF kernel (bf16 ``acc_s_cast``) and FlashMLA do. A row with no valid key
     yields zeros (HF: finite -1e30 lower bound)."""
     p_dtype = q.dtype if p_dtype is None else p_dtype
-    s = torch.einsum("thd,tkd->thk", q.float(), keys.float()) * softmax_scale
-    s = s.masked_fill(~valid[:, None, :], -torch.inf)
-    m = s.amax(dim=-1, keepdim=True)
-    has_key = valid.any(dim=-1)[:, None, None]
-    m = torch.where(has_key, m, torch.full_like(m, -1e30))
-    p = torch.exp(s - m)
-    l = p.sum(dim=-1, keepdim=True) + torch.exp(attn_sink.float()[None, :, None] - m)
-    o = torch.einsum("thk,tkd->thd", p.to(p_dtype).float(), keys.float())
-    return (o / l).to(q.dtype)
+    sm = sparse_softmax_terms(q, keys, valid, attn_sink, softmax_scale)
+    o = torch.einsum("thk,tkd->thd", sm.p.to(p_dtype).float(), keys.float())
+    return (o / sm.l).to(q.dtype)
+
+
+@dataclass
+class AttnMassSplit:
+    """Per-row, per-head attention mass.
+
+    ``sink`` + ``window`` + ``sparse`` sum to 1 on a row with keys. ``needle``
+    is a subset of window ∪ sparse, not a fourth bucket. Empty rows (no valid
+    key) are all zeros, not NaN. Fields other than ``sink_logit`` / counts
+    are [T, H].
+    """
+
+    sink: torch.Tensor
+    window: torch.Tensor
+    sparse: torch.Tensor
+    needle: torch.Tensor
+    max_score: torch.Tensor
+    sink_logit: torch.Tensor  # [H]
+    n_window: torch.Tensor  # [T]
+    n_sparse: torch.Tensor  # [T]
+    n_needle: torch.Tensor  # [T]
+
+    def mean_over_heads(self) -> Dict[str, torch.Tensor]:
+        return {
+            "sink": self.sink.mean(dim=-1),
+            "window": self.window.mean(dim=-1),
+            "sparse": self.sparse.mean(dim=-1),
+            "needle": self.needle.mean(dim=-1),
+            "max_score": self.max_score.mean(dim=-1),
+        }
+
+
+def sparse_attention_mass_split(
+    q: torch.Tensor,
+    keys: torch.Tensor,
+    valid: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    *,
+    window_width: int,
+    needle_mask: Optional[torch.Tensor] = None,
+) -> AttnMassSplit:
+    """Split softmax mass into sink / first ``window_width`` keys / the rest.
+
+    ``needle_mask`` is [T, K] bool over the same key axis as ``keys`` (window
+    then sparse). Mass on those keys is reported as ``needle``; it is a subset,
+    not an extra partition.
+    """
+    sm = sparse_softmax_terms(q, keys, valid, attn_sink, softmax_scale)
+    t, k = valid.shape
+    w = max(0, min(int(window_width), k))
+    has = sm.has_key.squeeze(-1).squeeze(-1)  # [T]
+    denom = sm.l.clamp_min(torch.finfo(sm.l.dtype).tiny)
+    key_mass = sm.p / denom
+    sink = (sm.sink_p / denom).squeeze(-1)
+    window = key_mass[..., :w].sum(dim=-1) if w else torch.zeros_like(sink)
+    sparse = key_mass[..., w:].sum(dim=-1) if w < k else torch.zeros_like(sink)
+    if needle_mask is None:
+        needle = torch.zeros_like(sink)
+        n_needle = torch.zeros(t, dtype=torch.int64)
+    else:
+        needle = (key_mass * needle_mask[:, None, :].to(key_mass.dtype)).sum(dim=-1)
+        n_needle = needle_mask.sum(dim=-1).to(torch.int64)
+    finite = has[:, None]
+    z = torch.zeros_like(sink)
+    max_score = sm.m.squeeze(-1)
+    max_score = torch.where(finite, max_score, z)
+    return AttnMassSplit(
+        sink=torch.where(finite, sink, z),
+        window=torch.where(finite, window, z),
+        sparse=torch.where(finite, sparse, z),
+        needle=torch.where(finite, needle, z),
+        max_score=max_score,
+        sink_logit=attn_sink.float(),
+        n_window=(
+            valid[:, :w].sum(dim=-1).to(torch.int64)
+            if w
+            else torch.zeros(t, dtype=torch.int64)
+        ),
+        n_sparse=(
+            valid[:, w:].sum(dim=-1).to(torch.int64)
+            if w < k
+            else torch.zeros(t, dtype=torch.int64)
+        ),
+        n_needle=n_needle,
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -64,7 +64,7 @@ def generate_ids(base: str, n_tokens: int, timeout: int) -> dict:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--base", default="http://127.0.0.1:30000")
+    p.add_argument("--base", default="http://127.0.0.1:11435")
     p.add_argument("--wait", type=int, default=0, help="seconds to wait for /health first")
     p.add_argument(
         "--steps",

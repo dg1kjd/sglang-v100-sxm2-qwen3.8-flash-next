@@ -195,6 +195,13 @@ class AnthropicServing:
         self._merge_inline_system = not detect_inline_system_support(
             self._chat_template()
         )
+        # V4.1 has no HF chat template, so the probe above says "merge".
+        # The custom encoder renders a mid-conversation system turn at its
+        # own position. Folding Claude Code's trailing harness reminder into
+        # the leading system block rewrites the token prefix on the next
+        # turn, and the sticky cache drops the pin.
+        if getattr(openai_serving_chat, "chat_encoding_spec", None) == "dsv41":
+            self._merge_inline_system = False
 
     def _chat_template(self) -> Optional[str]:
         tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)

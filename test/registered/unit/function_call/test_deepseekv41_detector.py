@@ -3,6 +3,9 @@
 from sglang.srt.entrypoints.openai.encoding_dsv41 import (
     dsml_token,
     encode_arguments_to_dsml,
+    encode_messages,
+    eos_token,
+    thinking_end_token,
     tool_call_tag_name,
     tool_calls_block_name,
     tool_parameter_tag_name,
@@ -128,6 +131,65 @@ class TestDeepSeekV41ReasoningParser(CustomTestCase):
         self.assertEqual(reasoning, "need weather")
         self.assertIn(tool_calls_block_name, normal)
         self.assertIn("get_weather", normal)
+
+
+class TestDsv41StickyPrefix(CustomTestCase):
+    def test_trailing_system_reminder_keeps_the_previous_prompt_as_prefix(self):
+        """A follow-up that leaves the previous harness reminder where it was
+        and appends a new one must keep the first turn's prompt plus the
+        assistant text as a prefix. That is the sticky-cache contract: the
+        next request's token ids have to start with the pinned sequence."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ]
+        system = {
+            "role": "system",
+            "content": "You are a coding assistant.",
+            "tools": tools,
+        }
+        user = {"role": "user", "content": "Read foo.py and tell me the first line."}
+        reminder = {
+            "role": "system",
+            "content": "<system-reminder>\nThe current date is 2026-09-22.\n</system-reminder>",
+        }
+        first = encode_messages(
+            [system, user, reminder],
+            thinking_mode="thinking",
+            drop_thinking=False,
+        )
+        output = "need the file" + thinking_end_token + "\n\nReading it." + eos_token
+        assistant = {
+            "role": "assistant",
+            "reasoning_content": "need the file",
+            "content": "\n\nReading it.",
+        }
+        follow = encode_messages(
+            [
+                system,
+                user,
+                reminder,
+                assistant,
+                {"role": "user", "content": "also check bar.py"},
+                {
+                    "role": "system",
+                    "content": "<system-reminder>\nfoo.py changed.\n</system-reminder>",
+                },
+            ],
+            thinking_mode="thinking",
+            drop_thinking=False,
+        )
+        self.assertTrue(follow.startswith(first + output))
 
 
 if __name__ == "__main__":

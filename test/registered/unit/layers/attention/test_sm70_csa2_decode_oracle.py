@@ -11,6 +11,7 @@ import torch
 from sglang.srt.layers.attention.dsv4 import sm70_csa2_reference as R
 from sglang.srt.layers.attention.dsv4.sm70_csa2 import (
     get_state,
+    sm70_commit_target_verify,
     sm70_forward_low_ratio_sources,
     sm70_forward_sparse,
 )
@@ -480,6 +481,206 @@ class TestSm70Csa2DecodeOracle(CustomTestCase):
                 ),
                 f"verify graph L{lid} maxabs={d}",
             )
+
+    def _snap_persistent(self, st):
+        return {
+            "swa": {k: v.clone() for k, v in st.swa_ring.items()},
+            "kv": {k: v.clone() for k, v in st.kv_rows.items()},
+            "ix": {k: v.clone() for k, v in st.index_rows.items()},
+            "pkv": {k: v.clone() for k, v in st.pending_kv.items()},
+            "psc": {k: v.clone() for k, v in st.pending_score.items()},
+        }
+
+    def _restore_persistent(self, st, snap):
+        for k, v in snap["swa"].items():
+            st.swa_ring[k].copy_(v)
+        for k, v in snap["kv"].items():
+            st.kv_rows[k].copy_(v)
+        for k, v in snap["ix"].items():
+            st.index_rows[k].copy_(v)
+        for k, v in snap["pkv"].items():
+            st.pending_kv[k].copy_(v)
+        for k, v in snap["psc"].items():
+            st.pending_score[k].copy_(v)
+
+    def _assert_persistent(self, got, exp, tag: str):
+        for name, exact in (("swa", True), ("kv", True), ("ix", True)):
+            for k, ev in exp[name].items():
+                gv = got[name][k]
+                n = int((gv != ev).sum().item())
+                self.assertEqual(n, 0, f"{tag} {name} L{k} byte diffs={n}")
+        for name in ("pkv", "psc"):
+            for k, ev in exp[name].items():
+                d = self._maxdiff(got[name][k], ev)
+                self.assertLess(d, 1e-4, f"{tag} {name} L{k} maxabs={d}")
+
+    def _backend_verify(self):
+        be = self._backend()
+        be.model_runner = SimpleNamespace(decode_num_tokens_per_req=lambda: 6)
+        return be
+
+    def _run_verify_batch(self, backend, layers, x, q_lora, q, positions):
+        fb = self._fb(False, target_verify=True)
+        outs = {}
+        for lid in LAYER_ORDER:
+            sm70_forward_low_ratio_sources(
+                backend, layers[lid], x, q_lora, positions, fb
+            )
+            outs[lid] = sm70_forward_sparse(
+                backend, q, layers[lid], fb, layers[lid].compress_ratio, self.sink
+            )
+        return outs
+
+    def _mixed_block(self, t0: int, commit_n: int, block: int = 6):
+        """Real tokens in the accepted prefix, unrelated hidden states after."""
+        sl = slice(t0, t0 + block)
+        x = self.x[sl].clone()
+        ql = self.q_lora[sl].clone()
+        q = self.q[sl].clone()
+        pos = self.positions[sl].clone()
+        n_junk = block - commit_n
+        g = torch.Generator(device="cpu").manual_seed(1000 + t0 * 10 + commit_n)
+        x[commit_n:] = (
+            torch.randn(n_junk, self.hidden, generator=g).to(FP16) * 0.2
+        ).to(self.dev)
+        ql[commit_n:] = (
+            torch.randn(n_junk, self.q_lora_r, generator=g).to(FP16) * 0.2
+        ).to(self.dev)
+        q[commit_n:] = (
+            torch.randn(n_junk, self.heads, 512, generator=g).to(FP16) * 0.2
+        ).to(self.dev)
+        return x, ql, q, pos
+
+    def _reference_accept(self, t0: int, commit_n: int):
+        """Token-by-token decode of the committed inputs, then one more token."""
+        layers = self._layers()
+        be = self._backend_verify()
+        self._run_extend(be, layers, slice(0, t0))
+        outs = []
+        for i in range(commit_n):
+            outs.append(self._run_decode(be, layers, t0 + i))
+        snap = self._snap_persistent(get_state(be))
+        nxt = self._run_decode(be, layers, t0 + commit_n)
+        return outs, snap, nxt
+
+    def _check_accept_outputs(self, ver, ref_outs, nxt, ref_nxt, tag: str):
+        for i, ref in enumerate(ref_outs):
+            for lid in LAYER_ORDER:
+                d = self._maxdiff(ver[lid][i : i + 1], ref[lid])
+                print(f"{tag} verify[{i}] L{lid} maxabs={d:.5f}")
+                self.assertTrue(
+                    torch.allclose(ver[lid][i : i + 1].float(), ref[lid].float(), atol=ATOL, rtol=RTOL),
+                    f"{tag} verify[{i}] L{lid} maxabs={d}",
+                )
+        for lid in LAYER_ORDER:
+            d = self._maxdiff(nxt[lid], ref_nxt[lid])
+            print(f"{tag} next L{lid} maxabs={d:.5f}")
+            self.assertTrue(
+                torch.allclose(nxt[lid].float(), ref_nxt[lid].float(), atol=ATOL, rtol=RTOL),
+                f"{tag} next L{lid} maxabs={d}",
+            )
+
+    def test_verify_rejection_matches_decode(self):
+        """Rejected drafts used to stay in the live ring and the ratio-2 slot.
+
+        Position 200's window still contains the slots that 201..205 alias
+        (distance 128). The verify block puts unrelated hidden states in that
+        tail. After commit of only the accepted prefix, the next real token
+        must match token-by-token decode that never saw the tail.
+        """
+        block = 6
+        for t0, commit_n in ((200, 1), (200, 2), (200, 5), (205, 1)):
+            tag = f"t0={t0} commit={commit_n}"
+            ref_outs, ref_snap, ref_nxt = self._reference_accept(t0, commit_n)
+            layers = self._layers()
+            be = self._backend_verify()
+            self._run_extend(be, layers, slice(0, t0))
+            st = get_state(be)
+            before = self._snap_persistent(st)
+            x, ql, q, pos = self._mixed_block(t0, commit_n, block)
+            ver = self._run_verify_batch(be, layers, x, ql, q, pos)
+            during = self._snap_persistent(st)
+            self._assert_persistent(
+                {"swa": during["swa"], "kv": {}, "ix": {},
+                 "pkv": during["pkv"], "psc": during["psc"]},
+                {"swa": before["swa"], "kv": {}, "ix": {},
+                 "pkv": before["pkv"], "psc": before["psc"]},
+                f"{tag} live-ring-and-pending",
+            )
+            # The forward did publish speculative compressed rows. Commit peels them.
+            self.assertFalse(
+                torch.equal(during["kv"][2], before["kv"][2]),
+                f"{tag} ratio-2 rows were not written during verify",
+            )
+            sm70_commit_target_verify(
+                be,
+                torch.tensor([commit_n], dtype=torch.int32, device=self.dev),
+                num_positions=block,
+            )
+            self._assert_persistent(self._snap_persistent(st), ref_snap, f"{tag} after-commit")
+            nxt = self._run_decode(be, layers, t0 + commit_n)
+            self._check_accept_outputs(ver, ref_outs, nxt, ref_nxt, tag)
+
+    def test_verify_rejection_commit_after_cuda_graph(self):
+        """Sampling accept runs after the verify graph. Commit must see the
+        replayed scratch, not the capture-time tokens.
+        """
+        t0, block, commit_n = 200, 6, 1
+        tag = "graph commit=1"
+        ref_outs, ref_snap, ref_nxt = self._reference_accept(t0, commit_n)
+        layers = self._layers()
+        be = self._backend_verify()
+        fb = self._fb(False, target_verify=True)
+        self._run_extend(be, layers, slice(0, t0))
+        st = get_state(be)
+        base = self._snap_persistent(st)
+        x, ql, q, pos = self._mixed_block(t0, commit_n, block)
+        static_x, static_ql, static_q, static_pos = x.clone(), ql.clone(), q.clone(), pos.clone()
+        # Allocate verify scratch, then put the live cache back.
+        self._run_verify_batch(be, layers, static_x, static_ql, static_q, static_pos)
+        self._restore_persistent(st, base)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        captured = {}
+        with torch.cuda.graph(graph):
+            for lid in LAYER_ORDER:
+                sm70_forward_low_ratio_sources(
+                    be, layers[lid], static_x, static_ql, static_pos, fb
+                )
+                captured[lid] = sm70_forward_sparse(
+                    be, static_q, layers[lid], fb, layers[lid].compress_ratio, self.sink
+                )
+        self._restore_persistent(st, base)
+        # Replay must not keep the capture-time tail. Fill a second junk pattern.
+        x2, ql2, q2, pos2 = self._mixed_block(t0, commit_n, block)
+        g = torch.Generator(device="cpu").manual_seed(4242)
+        x2[commit_n:] = (torch.randn(block - commit_n, self.hidden, generator=g).to(FP16) * 0.3).to(self.dev)
+        q2[commit_n:] = (
+            torch.randn(block - commit_n, self.heads, 512, generator=g).to(FP16) * 0.3
+        ).to(self.dev)
+        static_x.copy_(x2)
+        static_ql.copy_(ql2)
+        static_q.copy_(q2)
+        static_pos.copy_(pos2)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        during = self._snap_persistent(st)
+        self._assert_persistent(
+            {"swa": during["swa"], "kv": {}, "ix": {},
+             "pkv": during["pkv"], "psc": during["psc"]},
+            {"swa": base["swa"], "kv": {}, "ix": {},
+             "pkv": base["pkv"], "psc": base["psc"]},
+            f"{tag} live-ring-and-pending",
+        )
+        sm70_commit_target_verify(
+            be,
+            torch.tensor([commit_n], dtype=torch.int32, device=self.dev),
+            num_positions=block,
+        )
+        self._assert_persistent(self._snap_persistent(st), ref_snap, f"{tag} after-commit")
+        nxt = self._run_decode(be, layers, t0 + commit_n)
+        self._check_accept_outputs(captured, ref_outs, nxt, ref_nxt, tag)
 
 
 if __name__ == "__main__":

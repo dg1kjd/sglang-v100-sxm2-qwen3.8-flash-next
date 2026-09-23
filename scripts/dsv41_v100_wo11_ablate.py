@@ -111,7 +111,7 @@ def summarize_generate(out: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--base", default="http://127.0.0.1:30000")
+    p.add_argument("--base", default="http://127.0.0.1:11435")
     p.add_argument("--tag", required=True, help="on or zero")
     p.add_argument("--out-dir", default="/tmp/dsv41-wo11")
     p.add_argument("--timeout", type=int, default=1800)

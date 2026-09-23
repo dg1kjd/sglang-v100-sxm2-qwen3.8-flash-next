@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -10,6 +10,7 @@ from sglang.kernels.jit.utils import (
 )
 from sglang.srt.utils import is_hip, is_xpu
 
+from .kv_layout import KVLayout
 from .utils import make_name
 
 _FREQS_REAL_CACHE: dict = {}
@@ -70,9 +71,12 @@ def _jit_main_k_norm_rope_flashmla_module(
     head_dim: int,
     rope_dim: int,
     page_size: int,
+    layout: KVLayout,
 ):
     """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
-    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    args = make_cpp_args(
+        dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
+    )
     return load_jit(
         make_name("main_k_norm_rope_flashmla"),
         *args,
@@ -288,16 +292,21 @@ def fused_k_norm_rope_flashmla(
     out_loc: torch.Tensor,
     kvcache: torch.Tensor,
     page_size: int,
+    layout: Union[KVLayout, str] = KVLayout.V4,
 ) -> None:
+    """RMSNorm + RoPE ``kv`` and write it into the ``layout`` paged FlashMLA
+    cache at ``out_loc``."""
+    layout = KVLayout.parse(layout)
     freqs_real = _freqs_cis_as_real(freqs_cis)
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]
     if _is_xpu:
+        assert layout is KVLayout.V4, "the V4.1 KV layouts are CUDA (sm100) only"
         fused_k_norm_rope_flashmla_xpu(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
         )
     else:
         module = _jit_main_k_norm_rope_flashmla_module(
-            kv.dtype, head_dim, rope_dim, page_size
+            kv.dtype, head_dim, rope_dim, page_size, layout
         )
         module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)

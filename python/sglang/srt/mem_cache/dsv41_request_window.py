@@ -3,6 +3,7 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 
@@ -20,9 +21,8 @@ class WindowLayout(msgspec.Struct, frozen=True):
     size: int
 
     def copy_(self, other: "WindowLayout") -> None:
-        # Graph replay refreshes a captured layout in place: the captured copy
-        # kernels read these tensors by address, so their contents move, not
-        # the object.
+        # Captured copy kernels read these tensors by address, so a graph replay
+        # must refresh their contents in place, not rebind the object.
         assert self.size == other.size, (self.size, other.size)
         self.req.copy_(other.req)
         self.pos.copy_(other.pos)
@@ -122,11 +122,15 @@ def window_layout(
     )
 
 
-def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size):
+def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size, layout=KVLayout.V4):
+    """Move tokens between paged buffers of ``layout``: a data row and a scale row."""
     if not src_loc.numel():
         return
     src_loc, dst_loc = src_loc.long(), dst_loc.long()
-    for width, base in ((576, 0), (8, page_size * 576)):
+    for width, base in (
+        (layout.data_bytes, 0),
+        (layout.scale_bytes, page_size * layout.data_bytes),
+    ):
         cols = torch.arange(width, device=src.device)
         values = src[
             src_loc[:, None] // page_size,
@@ -196,8 +200,7 @@ class RequestWindow:
         if self.workspace is None:
             self._ensure_workspace(layout.size)
         elif self.workspace.size < layout.size:
-            # Captured graphs hold the workspace address; growing it here would
-            # leave them writing into a freed buffer. Size it at construction.
+            # Captured graphs hold the workspace address; growing it strands them.
             raise RuntimeError(
                 f"request-window workspace too small: {self.workspace.size} rows "
                 f"for a layout of {layout.size}"
@@ -220,9 +223,8 @@ class RequestWindow:
         )
 
     def buffer(self, layer):
-        # The runner's capture scope includes eager warmups, before CUDA capture
-        # starts. Include the phase in the key so leaving that scope revalidates
-        # ownership even when the layout and layer have not changed.
+        # The runner's capture scope includes eager warmups before CUDA capture
+        # starts, so the phase is part of the key: leaving the scope revalidates.
         in_capture = get_is_capture_mode() or _capturing()
         prepared_key = (layer, in_capture)
         if self.prepared != prepared_key:
@@ -244,6 +246,7 @@ class RequestWindow:
                 src,
                 layout.history_loc,
                 page_size=self.page_size,
+                layout=self.state.kv_layout,
             )
             self.prepared = prepared_key
         return self.workspace.kv_buffer[0]
@@ -261,5 +264,6 @@ class RequestWindow:
             layout.write_loc,
             dst,
             page_size=self.page_size,
+            layout=self.state.kv_layout,
         )
         self.tags[layer, dst] = layout.pos

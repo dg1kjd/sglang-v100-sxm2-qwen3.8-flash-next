@@ -11,6 +11,7 @@ import ctypes
 import glob
 import logging
 import mmap
+import errno
 import os
 import re
 import time
@@ -40,7 +41,6 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
-    get_attention_dp_size,
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
@@ -74,6 +74,20 @@ _ENGRAM_ZERO_LOGGED = False
 # cudaHostRegisterMapped: GPU kernels can UVA-load the host pointer. Flag 0
 # only pins for memcpy and is not enough for SM70 discrete-GPU gathers.
 _CUDA_HOST_REGISTER_MAPPED = 0x02
+
+
+def engram_shard_rows(num_rows: int, tp_rank: int, tp_size: int) -> tuple[int, int]:
+    """Half-open row range of the Engram table this TP rank copies.
+
+    The checkpoint tensor is ``[num_rows, dim]``. Integer division matches
+    ``EngramEmbedding`` so a pre-sliced load and a full-tensor load write the
+    same rows.
+    """
+    if tp_size <= 1:
+        return 0, int(num_rows)
+    start = int(num_rows) * int(tp_rank) // int(tp_size)
+    end = int(num_rows) * (int(tp_rank) + 1) // int(tp_size)
+    return start, end
 
 
 def engram_lookup_dtype(device: torch.device | str | int | None = None) -> torch.dtype:
@@ -199,6 +213,11 @@ class EngramLayout(msgspec.Struct, frozen=True):
             n_heads=n_heads,
             head_dim=head_dim,
         )
+
+    @classmethod
+    def from_config(cls, config) -> Optional["EngramLayout"]:
+        """Upstream alias for :func:`build_engram_layout`."""
+        return build_engram_layout(config)
 
 
 def build_engram_layout(config) -> Optional[EngramLayout]:
@@ -350,8 +369,8 @@ class EngramHasher(nn.Module):
             row = torch.repeat_interleave(torch.arange(bs, device=device), lens)
             num_real = row.shape[0]
             kmode = MODE_EXTEND
-            if forward_batch.ngram_history is not None:
-                history, hist_via_slots = forward_batch.ngram_history, False
+            if forward_batch.engram_history is not None:
+                history, hist_via_slots = forward_batch.engram_history, False
             commit_rows = torch.where(lens > 0, req_slots, self.pad_row)
             commit_last = (starts + lens - 1).clamp(0, num_tokens - 1)
 
@@ -901,8 +920,9 @@ class EngramEmbedding(nn.Module):
         self.dim = dim
         self.tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
-        self.row_start = num_embeddings * tp_rank // self.tp_size
-        row_end = num_embeddings * (tp_rank + 1) // self.tp_size
+        self.row_start, row_end = engram_shard_rows(
+            num_embeddings, tp_rank, self.tp_size
+        )
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
@@ -948,10 +968,16 @@ class EngramEmbedding(nn.Module):
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         rows = slice(self.row_start, self.row_start + self.rows)
-        if self._shared:
-            param.data[rows].copy_(loaded_weight[rows])
+        # A reader may already have sliced this rank's rows out of the checkpoint
+        # so the full table is never materialized. The full tensor still works.
+        if loaded_weight.shape[0] == self.rows:
+            shard = loaded_weight
         else:
-            param.data.copy_(loaded_weight[rows])
+            shard = loaded_weight[rows]
+        if self._shared:
+            param.data[rows].copy_(shard)
+        else:
+            param.data.copy_(shard)
         if self.host_table is not None:
             self.host_table.dirty = True
 
@@ -998,7 +1024,7 @@ class EngramEmbedding(nn.Module):
             attn_cp_all_gather_into_tensor(all_indices, indices.contiguous())
             start = parallel.attn_cp_rank * local_rows
             return self._lookup(all_indices)[start : start + local_rows]
-        if self.tp_size > 1 and get_attention_dp_size() > 1:
+        if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
 
@@ -1078,7 +1104,7 @@ class EngramEmbedding(nn.Module):
         if (
             padding is not None
             and padding.is_max_len()
-            and self.tp_size == get_attention_dp_size()
+            and self.tp_size == get_parallel().attn_dp_size
             and rows == self.tp_size * local.shape[0]
         ) or is_dp_gatherv_active():
             dp_reduce_scatter_tensor(local, values)

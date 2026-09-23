@@ -226,6 +226,17 @@ class DraftBackendFactory:
         backend.prefill_attention_backend_str = "qsa"
         backend.decode_attention_backend_str = "qsa"
 
+    def _create_qwen_qsa_draft_extend_backend(self):
+        from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+            QwenSparseAttnBackend,
+        )
+
+        # The draft is full-attention only: give it a QSA backend of its own
+        # instead of the hybrid wrapper whose linear side has no draft layers.
+        backend = QwenSparseAttnBackend(self.draft_model_runner)
+        self._stamp_qsa(backend)
+        return backend
+
     def _create_qwen_qsa_decode_backend(self):
         from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
             QwenSparseMultiStepDraftBackend,

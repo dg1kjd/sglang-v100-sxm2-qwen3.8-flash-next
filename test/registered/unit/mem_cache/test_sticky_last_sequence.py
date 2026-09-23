@@ -112,7 +112,8 @@ class _FakeInnerCache:
 
 
 class _FakeReq:
-    def __init__(self, req_pool_idx, committed, allocated, origin, output=None):
+    def __init__(self, req_pool_idx, committed, allocated, origin, output=None, rid=None):
+        self.rid = rid
         self.kv = ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=committed,
@@ -211,6 +212,68 @@ class TestStickyLastSequence(CustomTestCase):
         self.assertEqual(len(result.device_indices), 0)
         self.assertEqual(inner.matches, 1)
         self.assertIsNone(cache._last_ids)
+        self.assertEqual(cache._cuts, [])
+
+    def test_recorded_stop_hits_a_shorter_shared_prefix(self):
+        cache, inner, _, _ = self._make(row_len=16)
+        partial = _FakeReq(
+            req_pool_idx=0,
+            committed=8,
+            allocated=8,
+            origin=list(range(8)),
+        )
+        cache.cache_unfinished_req(partial)
+        self.assertEqual(cache._cuts, [8])
+        _, last = self._pin(cache, origin=list(range(8)), output=[8, 9])
+        self.assertEqual(last, list(range(10)))
+        self.assertEqual(cache._cuts, [8, 10])
+
+        nxt = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
+        result = cache.match_prefix(
+            MatchPrefixParams(key=_key(list(range(8)) + [99, 100]), req=nxt)
+        )
+        self.assertEqual(inner.matches, 0)
+        self.assertEqual(len(result.device_indices), 8)
+        self.assertEqual(result.device_indices.tolist(), list(range(8)))
+        self.assertEqual(nxt.kv.req_pool_idx, 0)
+        self.assertEqual(cache._last_ids, tuple(last))
+        self.assertEqual(cache._cuts, [8])
+
+    def test_unfinished_stop_is_extend_end_not_the_sampled_token(self):
+        cache, _, _, _ = self._make()
+        # Prefill result processing appends the sampled token first. The CSA2
+        # image still ends at the prompt.
+        req = _FakeReq(
+            req_pool_idx=0,
+            committed=8,
+            allocated=8,
+            origin=list(range(8)),
+            output=[8],
+        )
+        req.extend_range = type("Range", (), {"end": 8})()
+        cache.cache_unfinished_req(req)
+        self.assertEqual(cache._cuts, [8])
+
+    def test_chunk_stop_is_extend_end(self):
+        cache, _, _, _ = self._make()
+        req = _FakeReq(
+            req_pool_idx=0,
+            committed=4,
+            allocated=4,
+            origin=list(range(10)),
+        )
+        req.extend_range = type("Range", (), {"end": 4})()
+        cache.cache_unfinished_req(req)
+        self.assertEqual(cache._cuts, [4])
+
+    def test_cuts_keep_the_newest_stops(self):
+        cache, _, _, _ = self._make()
+        for length in range(1, 40):
+            cache._last_ids = None
+            cache._note_cut(list(range(length)))
+        self.assertEqual(len(cache._cuts), 32)
+        self.assertEqual(cache._cuts[0], 8)
+        self.assertEqual(cache._cuts[-1], 39)
 
     def test_different_tokens_miss(self):
         cache, inner, _, _ = self._make()
@@ -260,6 +323,65 @@ class TestStickyLastSequence(CustomTestCase):
         self.assertIsNone(cache._last_ids)
         self.assertEqual(inner.finished, [req])
 
+    def test_abort_pins_last_completed_chunk(self):
+        cache, inner, allocator, pool = self._make(row_len=16)
+        req = _FakeReq(
+            req_pool_idx=0,
+            committed=8,
+            allocated=12,
+            origin=list(range(12)),
+        )
+        req.extend_range = type("R", (), {"end": 4})()
+        cache.cache_unfinished_req(req)
+        req.extend_range = type("R", (), {"end": 8})()
+        cache.cache_unfinished_req(req)
+        req.finished_reason = FINISH_ABORT("client")
+        cache.cache_finished_req(req)
+
+        self.assertEqual(cache._last_ids, tuple(range(8)))
+        self.assertEqual(inner.finished, [])
+        self.assertIsNone(req.kv.req_pool_idx)
+        self.assertEqual(cache._slot.kv.kv_allocated_len, 8)
+        self.assertEqual(pool.free_slots, [])
+        self.assertEqual(allocator.freed[0].tolist(), list(range(8, 12)))
+
+        nxt = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
+        result = cache.match_prefix(
+            MatchPrefixParams(key=_key(list(range(12))), req=nxt)
+        )
+        self.assertEqual(len(result.device_indices), 8)
+        self.assertEqual(result.device_indices.tolist(), list(range(8)))
+        self.assertEqual(inner.matches, 0)
+
+        other = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
+        missed = cache.match_prefix(
+            MatchPrefixParams(key=_key([99, 100, 101]), req=other)
+        )
+        self.assertEqual(len(missed.device_indices), 0)
+        self.assertIsNone(cache._last_ids)
+        self.assertEqual(inner.matches, 1)
+
+    def test_abort_pins_unstashed_extend_end(self):
+        # The chunk that just finished is snapshotted in the worker before
+        # stash, so the abort has to pin extend_range.end on its own.
+        cache, inner, _, _ = self._make(row_len=16)
+        req = _FakeReq(
+            req_pool_idx=0,
+            committed=8,
+            allocated=8,
+            origin=list(range(12)),
+        )
+        req.extend_range = type("R", (), {"end": 8})()
+        req.finished_reason = FINISH_ABORT("client")
+        cache.cache_finished_req(req)
+        self.assertEqual(cache._last_ids, tuple(range(8)))
+        self.assertEqual(inner.finished, [])
+        nxt = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
+        result = cache.match_prefix(
+            MatchPrefixParams(key=_key(list(range(12))), req=nxt)
+        )
+        self.assertEqual(len(result.device_indices), 8)
+
     def test_reset_frees_pin(self):
         cache, inner, allocator, pool = self._make()
         self._pin(cache, origin=list(range(4)), output=[4, 5])
@@ -290,3 +412,34 @@ class TestStickyLastSequence(CustomTestCase):
         self.assertEqual(cache.session_held_tokens(), 6)
         self.assertEqual(cache.session_held_tokens(active_pool_idxs={0}), 0)
         self.assertEqual(cache.session_held_req_count(active_pool_idxs={0}), 0)
+
+    def test_health_check_miss_does_not_drop_pin(self):
+        cache, inner, allocator, pool = self._make()
+        _, last = self._pin(cache, origin=list(range(8)), output=[8, 9])
+        nxt = _FakeReq(
+            req_pool_idx=None,
+            committed=0,
+            allocated=0,
+            origin=[],
+            rid="HEALTH_CHECK_abc",
+        )
+        result = cache.match_prefix(MatchPrefixParams(key=_key([0]), req=nxt))
+        self.assertEqual(len(result.device_indices), 0)
+        self.assertEqual(inner.matches, 1)
+        self.assertEqual(cache._last_ids, tuple(last))
+        self.assertEqual(pool.free_slots, [])
+        self.assertFalse(allocator.freed)
+
+    def test_health_check_finish_does_not_pin(self):
+        cache, inner, _, _ = self._make()
+        req = _FakeReq(
+            req_pool_idx=0,
+            committed=1,
+            allocated=1,
+            origin=[0],
+            rid="HEALTH_CHECK_abc",
+        )
+        cache.cache_finished_req(req, kv_len_to_handle=1)
+        self.assertIsNone(cache._last_ids)
+        self.assertEqual(inner.finished, [req])
+        self.assertEqual(cache.session_held_req_count(), 0)

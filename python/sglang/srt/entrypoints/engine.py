@@ -329,7 +329,7 @@ class Engine(EngineScoreMixin, EngineBase):
         if get_observability().enable_trace:
             process_tracing_init(
                 get_observability().otlp_traces_endpoint,
-                "sglang",
+                get_observability().otlp_service_name,
                 trace_modules=get_observability().trace_modules,
             )
             thread_label = "Tokenizer"
@@ -1407,6 +1407,7 @@ class Engine(EngineScoreMixin, EngineBase):
             "load_format": tm.config_value("load_format"),
             "reasoning_parser": tm.config_value("reasoning_parser"),
             "tool_call_parser": tm.config_value("tool_call_parser"),
+            "disaggregation_mode": tm.config_value("disaggregation_mode"),
         }
 
     def init_weights_update_group(
@@ -1715,8 +1716,14 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set ulimit
     set_ulimit()
 
-    # Check flashinfer version
-    if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
+    # Check flashinfer / sglang-kernel versions. V100 is pinned to
+    # sglang-kernel 0.4.6.post1 (CUDA 12.8); upstream now requires 0.4.7.
+    skip_kernel_pkg = get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK")
+    skip_sgl_kernel_on_sm70 = False
+    if _is_cuda and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        skip_sgl_kernel_on_sm70 = major == 7 and minor == 0
+    if not skip_kernel_pkg:
         if (
             "flashinfer" in attention_backends_of(resolved_view(cfg))
             or cfg.dsa_topk_backend == "flashinfer"
@@ -1729,10 +1736,10 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
             )
-        if _is_cuda:
+        if _is_cuda and not skip_sgl_kernel_on_sm70:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.6.post1",
+                "0.4.7",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
@@ -1783,6 +1790,7 @@ def _log_legacy_kernel_cache_dirs():
             os.path.expanduser("~/.triton"),
             os.path.expanduser("~/.cache/flashinfer"),
             os.path.expanduser("~/.cache/deep_gemm"),
+            os.path.expanduser("~/.tilelang/cache"),
         )
         if os.path.isdir(d)
     ]

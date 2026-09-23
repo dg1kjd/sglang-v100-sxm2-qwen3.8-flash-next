@@ -7,7 +7,7 @@ Turn 2: structured JSON self-assessment of that reply.
 Heuristics also score turn 1 independently of the model's self-report, so a
 confabulating assessor cannot hide a broken sentence.
 
-Not CI. Needs the live 8×V100 unit (default http://127.0.0.1:30000).
+Not CI. Needs the live 8×V100 unit (default http://127.0.0.1:11435).
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import time
 import urllib.request
 from typing import Any
 
-DEFAULT_BASE = "http://127.0.0.1:30000"
+DEFAULT_BASE = "http://127.0.0.1:11435"
 
 PROMPTS = [
     "Was Santa Claus invented by the Coca-Cola company? Answer in a few short paragraphs.",

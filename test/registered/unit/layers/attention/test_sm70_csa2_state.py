@@ -71,6 +71,25 @@ class TestRingValid(CustomTestCase):
 
 
 class TestPrefillSwaGather(CustomTestCase):
+    def test_scratch_allocated_in_inference_mode_stays_writable(self):
+        from sglang.srt.layers.attention.dsv4 import sm70_csa2 as m
+
+        backend = SimpleNamespace(max_context_len=64)
+        st = m.get_state(backend)
+        layer = SimpleNamespace(
+            layer_id=3, compress_ratio=0, compressor=None, indexer=None
+        )
+        topo = {
+            "sliding_window": 8,
+            "candidate_block_size": 8,
+            "candidate_topk_blocks": 4,
+            "index_topk": 4,
+        }
+        with torch.inference_mode():
+            m._ensure_buffers(st, layer, topo, torch.device("cpu"), backend)
+        scratch = st.swa_scratch[3]
+        self.assertFalse(scratch.is_inference())
+        scratch[:1].copy_(torch.ones(1, scratch.shape[1], dtype=scratch.dtype))
     def test_gather_matches_absolute_rows(self):
         st = Sm70Csa2State(sliding_window=128)
         st.swa_ring[0] = torch.zeros(128, 4, dtype=torch.int32)
@@ -334,6 +353,7 @@ class TestPackedCsa2Routing(CustomTestCase):
 
         def fake_pack(layer, *_a, **_k):
             packed_with.append(getattr(layer, "name", "?"))
+            return torch.zeros(2, 4, dtype=torch.uint8)
 
         q = torch.zeros(2, 2, 4)
         positions = torch.arange(2)
@@ -341,8 +361,9 @@ class TestPackedCsa2Routing(CustomTestCase):
         radix = SimpleNamespace(name="radix", layer_id=0, qk_head_dim=512)
         dummy_rows = torch.zeros(2, 8, m.SWA_ROW_BYTES, dtype=torch.uint8)
         dummy_valid = torch.ones(2, 8, dtype=torch.bool)
-        with patch.object(m, "_decode_pack_swa", side_effect=fake_pack), patch.object(
-            m, "_gather_swa_from_ring", return_value=(dummy_rows, dummy_valid)
+        before = st.swa_ring[0].clone()
+        with patch.object(m, "_pack_verify_swa", side_effect=fake_pack), patch.object(
+            m, "_gather_verify_swa", return_value=(dummy_rows, dummy_valid)
         ), patch.object(
             m,
             "unpack_swa_fp8_ue8m0",
@@ -356,4 +377,108 @@ class TestPackedCsa2Routing(CustomTestCase):
         self.assertEqual(packed_with, ["mqa"])
         self.assertEqual(tuple(out.shape), (2, 2, 4))
         self.assertNotIn(0, st.verify_kv)
+        self.assertTrue(torch.equal(st.swa_ring[0], before))
+
+    def test_verify_gather_keeps_committed_window(self):
+        """A draft at pos+128 used to overwrite a live ring slot still inside
+        the query window. Verify reads committed history plus this block, and
+        leaves that slot alone.
+        """
+        from sglang.srt.layers.attention.dsv4 import sm70_csa2 as m
+
+        w = 8
+        st = Sm70Csa2State(sliding_window=w)
+        st.swa_ring[0] = torch.zeros(w, 1, dtype=torch.int32)
+        for p in range(16):
+            st.swa_ring[0][p % w, 0] = p
+        packed = torch.tensor([[16], [17], [18]], dtype=torch.int32)
+        positions = torch.tensor([16, 17, 18])
+        rows, valid = m._gather_verify_swa(st, 0, packed, positions)
+        self.assertEqual(rows[0, :, 0].tolist(), list(range(9, 17)))
+        self.assertTrue(bool(valid[0].all()))
+        self.assertEqual(int(st.swa_ring[0][1, 0]), 9)
+
+    def test_commit_keeps_only_the_accepted_prefix(self):
+        """commit_lens is the anchor plus accepted drafts. The unaccepted tail
+        must not stay in the ring, the ratio-2 pending slot, or a compressed
+        pair that included a rejected partner.
+        """
+        from sglang.srt.layers.attention.dsv4 import sm70_csa2 as m
+
+        w = 8
+        st = Sm70Csa2State(sliding_window=w)
+        st.swa_ring[0] = torch.full((w, 1), 50, dtype=torch.int32)
+        st.verify_swa_packed[0] = torch.tensor([[1], [2], [3], [4]], dtype=torch.int32)
+        st.verify_positions = torch.tensor([6, 7, 8, 9])
+        st.verify_open = torch.ones(1, dtype=torch.int32)
+        st.verify_t = torch.tensor([4], dtype=torch.int32)
+        st.pending_kv[3] = torch.tensor([9.0])
+        st.pending_score[3] = torch.tensor([8.0])
+        st.verify_pending_kv_traj[3] = torch.tensor([[10.0], [20.0], [30.0], [40.0]])
+        st.verify_pending_score_traj[3] = torch.tensor([[1.0], [2.0], [3.0], [4.0]])
+        # Steps 0 and 1 share row 5 (even then odd). Steps 2 and 3 share row 6.
+        table = torch.tensor([[0], [0], [0], [0], [0], [2], [4]], dtype=torch.uint8)
+        st.kv_rows[3] = table
+        st.verify_row[3] = torch.tensor([5, 5, 6, 6])
+        st.verify_kv_orig[3] = torch.tensor([[7], [1], [8], [3]], dtype=torch.uint8)
+        backend = SimpleNamespace(_sm70_csa2=st)
+
+        m.sm70_commit_target_verify(backend, torch.tensor([1]), num_positions=4)
+        self.assertEqual(int(st.swa_ring[0][6, 0]), 1)
+        self.assertEqual(int(st.swa_ring[0][7, 0]), 50)
+        self.assertEqual(int(st.swa_ring[0][0, 0]), 50)
+        self.assertEqual(int(st.swa_ring[0][1, 0]), 50)
+        self.assertEqual(st.pending_kv[3].tolist(), [10.0])
+        self.assertEqual(st.pending_score[3].tolist(), [1.0])
+        self.assertEqual(int(table[5, 0]), 1)
+        self.assertEqual(int(table[6, 0]), 8)
+        self.assertEqual(int(st.verify_open[0]), 0)
+
+        st.pending_kv[3].fill_(999)
+        m.sm70_commit_target_verify(backend, torch.tensor([4]), num_positions=4)
+        self.assertEqual(st.pending_kv[3].tolist(), [999.0])
+
+    def test_verify_pending_does_not_touch_the_live_slot(self):
+        """The ratio-2 recurrence during verify runs on a scratch cursor.
+        The live slot stays on the last committed token until commit.
+        """
+        from sglang.srt.layers.attention.dsv4 import sm70_csa2 as m
+
+        st = Sm70Csa2State()
+        st.pending_kv[0] = torch.tensor([1.0])
+        st.pending_score[0] = torch.tensor([2.0])
+        prev_kv, prev_score = m._verify_pending_prev(st, 0, 0)
+        self.assertEqual(prev_kv.tolist(), [1.0])
+        self.assertEqual(prev_score.tolist(), [2.0])
+        m._verify_pending_save(
+            st, 0, 0, torch.tensor([[3.0]]), torch.tensor([[4.0]])
+        )
+        self.assertEqual(st.pending_kv[0].tolist(), [1.0])
+        self.assertEqual(st.pending_score[0].tolist(), [2.0])
+        self.assertEqual(st.verify_pending_kv_traj[0][0].tolist(), [3.0])
+        prev_kv, _prev_score = m._verify_pending_prev(st, 0, 1)
+        self.assertEqual(prev_kv.tolist(), [3.0])
+        self.assertEqual(st.pending_kv[0].tolist(), [1.0])
+
+    def test_pack_verify_swa_leaves_the_live_ring(self):
+        from sglang.srt.layers.attention.dsv4 import sm70_csa2 as m
+
+        st = Sm70Csa2State(sliding_window=8)
+        st.swa_ring[0] = torch.full((8, m.SWA_ROW_BYTES), 7, dtype=torch.uint8)
+        layer = SimpleNamespace(qk_rope_head_dim=64, layer_id=0)
+        kv = torch.zeros(3, 4)
+        positions = torch.tensor([6, 7, 8])
+        marker = torch.arange(3, dtype=torch.uint8)[:, None].expand(3, m.SWA_ROW_BYTES).contiguous()
+
+        def write_stage(dst, _kv, pos, **_k):
+            slots = torch.remainder(pos.to(dtype=torch.int64), dst.shape[0])
+            for i, slot in enumerate(slots.tolist()):
+                dst[int(slot)].fill_(i + 1)
+
+        with patch.object(m, "_attn_glue_on", return_value=True), patch.object(
+            m, "_freqs_table", return_value=torch.zeros(1)
+        ), patch.object(m, "pack_swa_fp8_at", side_effect=write_stage):
+            packed = m._pack_verify_swa(layer, kv, positions, st, 0)
+        self.assertTrue(torch.equal(st.swa_ring[0], torch.full_like(st.swa_ring[0], 7)))
+        self.assertEqual(packed[:, 0].tolist(), [1, 2, 3])
 

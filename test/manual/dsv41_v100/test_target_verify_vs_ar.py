@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare DSpark's 6-token main-model sign-off with the AR-matching next token.
 
-Not CI. Talks to a live 8xV100 server (default http://127.0.0.1:30000). Import
+Not CI. Talks to a live 8xV100 server (default http://127.0.0.1:11435). Import
 and --self-test need no GPU and do not import sglang or torch.
 
 Why this is not the stock KL helper
@@ -55,7 +55,7 @@ Example::
 
   PYTHONPATH=python $HOME/sglang-v100-venv/bin/python \\
     test/manual/dsv41_v100/test_target_verify_vs_ar.py \\
-    --base http://127.0.0.1:30000
+    --base http://127.0.0.1:11435
 """
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-DEFAULT_BASE = "http://127.0.0.1:30000"
+DEFAULT_BASE = "http://127.0.0.1:11435"
 DEFAULT_OUT = (
     "$HOME/dsv41-v100-logs/2026-09-18/prefill-vs-ar-target-verify.json"
 )

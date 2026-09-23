@@ -584,6 +584,37 @@ class DSparkV4MarkovHead(nn.Module):
             collect_corrected=collect_corrected,
         )
 
+    @property
+    def supports_sharded_greedy(self) -> bool:
+        return (
+            self._is_dsv41 and self._tp_shard is not None and self._opt_markov_w2_bf16
+        )
+
+    def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
+        if not self.supports_sharded_greedy or not base_logits.is_cuda:
+            return None
+        from sglang.kernels.ops.speculative.dspark.sharded_greedy import (
+            sharded_greedy_step,
+        )
+
+        shard = self._tp_shard
+        weight = self.markov_w2.weight[shard.org_vocab_start : shard.org_vocab_end]
+        prev = first_prev_tokens.long()
+        tokens = []
+        for step in range(base_logits.shape[1]):
+            latent = self.get_prev_embeddings(prev)
+            # Preserve the same BF16 GEMM rounding before the FP32 logits add.
+            bias = F.linear(latent.to(weight.dtype), weight)
+            prev = sharded_greedy_step(
+                bias,
+                base_logits[:, step],
+                group=self._shard_group,
+                vocab_start=shard.org_vocab_start,
+                gather=self._vocab_gather.gather_stacked,
+            )
+            tokens.append(prev)
+        return torch.stack(tokens, dim=1)
+
 
 def build_dspark_v4_confidence_head(
     *, config: DeepSeekV4Config, markov_rank: int
@@ -703,6 +734,67 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
                 x, forward_batch, input_ids=None, input_ids_global=None
             )
         return y.view(shape)
+
+    def _hc_pre_block(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        y, post, comb, _ = self.hc_pre(x, hc_fn, hc_scale, hc_base)
+        return y, post, comb
+
+    def _hc_post_block(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.hc_post(x, residual, post, comb)
+
+    def _forward_hc_pre_from_prev(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prev_pre: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
+        residual = hidden_states
+        x = self._hc_combine(
+            hidden_states, prev_pre, self.input_layernorm, stats_stream
+        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = self.self_attn(positions, x, forward_batch)
+        attn_pre, attn_post, attn_comb = self._hc_mix_stats(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            stats_stream,
+        )
+        if stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(stats_stream)
+        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
+
+        residual = hidden_states
+        x = self._hc_combine(
+            hidden_states, attn_pre, self.post_attention_layernorm, stats_stream
+        )
+        x = self._run_ffn(x, forward_batch)
+        ffn_pre, ffn_post, ffn_comb = self._hc_mix_stats(
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            stats_stream,
+        )
+        if stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(stats_stream)
+        hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+        return hidden_states, ffn_pre
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
@@ -981,6 +1073,25 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         expect(_CONFIDENCE, confidence)
         return confidence
 
+    def checkpoint_tensor_reader(self):
+        """The draft checkpoint lives in ``mtp.*`` of the target files.
+
+        Do not consult the target's expert-location metadata: it describes 384
+        experts and may still be installed in this process.
+        """
+        from sglang.srt.model_loader.dsv4_checkpoint_read import (
+            make_dsv4_checkpoint_reader,
+        )
+
+        reader = make_dsv4_checkpoint_reader(
+            n_routed_experts=int(self.config.n_routed_experts),
+            mtp_only=True,
+            narrow_engram=False,
+            use_expert_location_metadata=False,
+        )
+        self._checkpoint_reader = reader
+        return reader
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()
@@ -1077,6 +1188,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_markov_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        reader = getattr(self, "_checkpoint_reader", None)
+        if reader is not None:
+            reader.finish()
 
     def _assert_markov_head_loaded(
         self, *, params_dict: dict, loaded_params: set
@@ -1213,3 +1327,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
 
 EntryClass = [DeepseekV4ForCausalLMDSpark]
+
+def _dspark_stage_config(config: DeepSeekV4Config) -> DeepSeekV4Config:
+    n_routed = int(getattr(config, "dspark_n_routed_experts", 0) or 0)
+    n_active = int(getattr(config, "dspark_num_experts_per_tok", 0) or 0)
+    has_vision = int(getattr(config, "vision_n_layers", 0) or 0) > 0
+    if not (n_routed or n_active or has_vision):
+        return config
+    stage_config = copy.copy(config)
+    if n_routed:
+        stage_config.n_routed_experts = n_routed
+    if n_active:
+        stage_config.num_experts_per_tok = n_active
+    if has_vision:
+        stage_config.vision_n_layers = 0
+    return stage_config
+

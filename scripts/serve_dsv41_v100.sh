@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # V1 launch shape for official deepseek-ai/DeepSeek-V4.1-Flash on 8xV100.
+# Bind is the same as Qwen: 0.0.0.0:11435 (SGLANG_V100_HOST/PORT).
 # Mixed MXFP4 experts + MXFP8 dense (packed e4m3+UE8M0 on SM70; GEMV at decode).
 # SGLANG_DSV41_MXFP8_W8A16=0 unpacks dense MXFP8 to FP16.
 set -euo pipefail
@@ -7,6 +8,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/sglang-v100-venv/bin:$PATH"
 export PYTHONPATH="${ROOT}/python${PYTHONPATH:+:$PYTHONPATH}"
+# V100 runtime pin is sglang-kernel 0.4.6.post1, not upstream 0.4.7.
+export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK="${SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK:-1}"
 export CC=/usr/bin/gcc-14 CXX=/usr/bin/g++-14 CUDAHOSTCXX=/usr/bin/g++-14
 export NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-14"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -56,7 +59,9 @@ export SGLANG_OPT_FP8_WO_A_GEMM="${SGLANG_OPT_FP8_WO_A_GEMM:-0}"
 # A window-only 1024-token floor livelocked 8k prefill (relaunch148).
 # 144 OOM'd 8k when that pool still scaled with context (2394 B/tok →
 # 135k profile, then CSA2@256k). Override with SGLANG_DSV41_CONTEXT_LEN.
-# Do not call /health (drops the sticky pin).
+# Do not generate on /health (the dummy token is a sticky miss). Claude Code
+# and load balancers still GET /health; keep it a liveness probe.
+export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION="${SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION:-0}"
 # Pre-warm NCCL while the card is empty.
 # Decode is ~100 small f16 all-reduces/token. RING_LL on this hybrid mesh was
 # ~73% of GPU time (relaunch55). Tree for AllReduce; do not pin PROTO=LL
@@ -89,9 +94,12 @@ if [[ "${SGLANG_DSV41_DSPARK}" == "1" ]]; then
   # Capture CSA2+mHC in the verify graph. Rollback 1 if capture hits a host sync.
   export SGLANG_DSV41_EAGER_CSA2_HC="${SGLANG_DSV41_EAGER_CSA2_HC:-0}"
   # D15-0: 0.99 spends slack on KV; T=6 verify capture then OOMs unpacking
-  # Engram MXFP8 wkv (~300 MiB, relaunch115). 0.88 is the floor that still
-  # allocates a KV pool after draft weights (0.87 raises).
-  export SGLANG_DSV41_MEM_FRACTION="${SGLANG_DSV41_MEM_FRACTION:-0.88}"
+  # Engram MXFP8 wkv (~300 MiB, relaunch115). Spill 13 frees ~0.7 GiB at
+  # load, but mem-fraction vacuums that into the KV pool — leftover for
+  # the unpack stays ~12% of pre-load. 0.88 left TP7 with 284 MiB free
+  # on a 461-token sticky prefill (need 300; 2026-09-20 manual eval).
+  # 0.87 keeps the 256k pool (draft leftover 4.53 GiB; 0.86 raises).
+  export SGLANG_DSV41_MEM_FRACTION="${SGLANG_DSV41_MEM_FRACTION:-0.87}"
   SPEC_FLAGS+=(--speculative-algorithm DSPARK --speculative-draft-model-path "${MODEL}")
 else
   export SGLANG_DSV41_SPILL_LANDING="${SGLANG_DSV41_SPILL_LANDING:-6}"
@@ -123,9 +131,10 @@ else
 fi
 # SM70 CSA2 packed SWA/KV lives on the attention backend, not in the radix
 # tree. A radix prefix hit skips hidden states and desyncs ratio-2 pending
-# (turn-3 crash: pos 511 layer 2). Keep radix off. One-slot token-id
-# continuation (exact last finished sequence only) pins KV across HTTP
-# turns of one full-history chat. Partial prefix /health drops the pin.
+# (turn-3 crash: pos 511 layer 2). Keep radix off. Sticky last-seq pins the
+# resident image: exact continuation, or a shorter prefix that was recorded
+# at a prefill/request stop (WO-17). Anything else, including a second
+# conversation, drops the pin and prefills from 0. /health does not.
 GRAPH_FLAGS+=(--disable-radix-cache)
 export SGLANG_DSV41_STICKY_LAST_SEQ="${SGLANG_DSV41_STICKY_LAST_SEQ:-1}"
 
@@ -166,6 +175,7 @@ exec "${NSYS_WRAP[@]}" python -m sglang.launch_server \
   --max-total-tokens "${SGLANG_DSV41_CONTEXT_LEN}" \
   --max-prefill-tokens "${SGLANG_DSV41_CONTEXT_LEN}" \
   --pre-warm-nccl \
+  --warmups dsv41_chunk \
   "${GRAPH_FLAGS[@]}" \
   --language-model-only \
   --reasoning-parser deepseek-v41 \
@@ -173,6 +183,6 @@ exec "${NSYS_WRAP[@]}" python -m sglang.launch_server \
   --trust-remote-code \
   --disable-custom-all-reduce \
   "${SPEC_FLAGS[@]}" \
-  --host 0.0.0.0 \
-  --port "${PORT:-30000}" \
+  --host "${SGLANG_V100_HOST:-${HOST:-0.0.0.0}}" \
+  --port "${SGLANG_V100_PORT:-${PORT:-11435}}" \
   "$@"

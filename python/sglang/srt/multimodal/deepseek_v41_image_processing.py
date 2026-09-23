@@ -21,6 +21,8 @@ from PIL import Image, ImageOps
 
 IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
 
+GPU_PLAN_KEY = "dsv41_gpu_plan"
+
 
 def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
     return n_llm_h * (n_llm_w + 1) + 2
@@ -237,3 +239,16 @@ def materialize_image_gpu(pixels: torch.Tensor, plan: dict) -> torch.Tensor:
     p = plan["patch_size"]
     h, w = plan["height"] // p, plan["width"] // p
     return x.reshape(3, h, p, w, p).permute(1, 3, 0, 2, 4).reshape(h * w, 3, p, p)
+
+
+def to_rgb(image: Image.Image) -> Image.Image:
+    """The same RGB conversion for every preprocessing backend."""
+    return image.convert("RGB")
+
+
+def patchify_image(image, args):
+    return load_image(image, args)
+
+
+def patchify_image_rust(image, args, *, resize_patchify):
+    return load_image_rust(image, args, resize_patchify=resize_patchify)

@@ -72,6 +72,9 @@ class MoeRunnerConfig:
     # model-specific activation restores this scale in FP32 before applying
     # SwiGLU, preventing an earlier overflow without changing the function.
     gate_up_input_scale: float = 1.0
+    # Request FP32 SiLU/multiply intermediates until FP8 quantization.
+    # False preserves backend defaults, including their existing FP32 paths.
+    silu_mul_keep_fp32: bool = False
 
 
 @dataclass

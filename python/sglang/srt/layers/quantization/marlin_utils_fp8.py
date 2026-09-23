@@ -304,14 +304,34 @@ def dequant_mxfp8_ue8m0_to_fp16(
 
     raw = sm70_mxfp4_ue8m0_to_uint8(scales)
     sf = raw.view(torch.float8_e8m0fnu).float()
-    wf = weight.float()
+    # Allocate the fp16 result first, then dequant in row stripes so we never
+    # hold a full fp32 copy (~2x) plus the fp16 out at once. Prefill on 32 GiB
+    # V100 otherwise OOMs the `.to(fp16)` after a 2048-token extend.
+    if weight.is_cuda:
+        free_b, _ = torch.cuda.mem_get_info()
+        need_b = n * k * (2 if out_dtype == torch.float16 else 4) + 64 * 1024 * 1024
+        if free_b < need_b:
+            torch.cuda.empty_cache()
+    out = torch.empty((n, k), dtype=out_dtype, device=weight.device)
+    row_bytes = k * 4
+    stripe = max(bn, min(n, (16 * 1024 * 1024) // max(row_bytes, 1)))
+    if bn > 1:
+        stripe = max(bn, (stripe // bn) * bn)
     if bn == 1:
         if sf.numel() != n * (k // bk):
             raise RuntimeError(
                 f"MXFP8 1x32 scale numel {sf.numel()} != N*(K/32)={n * (k // bk)} "
                 f"for weight {tuple(weight.shape)}"
             )
-        out = (wf.view(n, k // bk, bk) * sf.reshape(n, k // bk, 1)).reshape(n, k)
+        sf_nk = sf.reshape(n, k // bk)
+        for i0 in range(0, n, stripe):
+            i1 = min(n, i0 + stripe)
+            ns = i1 - i0
+            wf = weight[i0:i1].float()
+            chunk = (wf.view(ns, k // bk, bk) * sf_nk[i0:i1].unsqueeze(-1)).reshape(
+                ns, k
+            )
+            out[i0:i1] = chunk.to(out_dtype)
     else:
         pn = ((n + bn - 1) // bn) * bn
         pk = ((k + bk - 1) // bk) * bk
@@ -321,15 +341,25 @@ def dequant_mxfp8_ue8m0_to_fp16(
                 f"(N/32)*(K/32)={(pn // bn) * (pk // bk)} for weight "
                 f"{tuple(weight.shape)}"
             )
-        if (n, k) != (pn, pk):
-            padded = wf.new_zeros(pn, pk)
-            padded[:n, :k] = wf
-            wf = padded
-        out = (
-            wf.view(pn // bn, bn, pk // bk, bk)
-            * sf.reshape(pn // bn, pk // bk)[:, None, :, None]
-        ).reshape(pn, pk)[:n, :k]
-    return out.to(out_dtype)
+        sf_tiles = sf.reshape(pn // bn, pk // bk)
+        for i0 in range(0, pn, stripe):
+            i1 = min(pn, i0 + stripe)
+            n_pad = i1 - i0
+            wf = weight.new_zeros((n_pad, pk), dtype=torch.float32)
+            src_n = min(n, i1) - min(n, i0)
+            if src_n > 0:
+                wf[:src_n, :k] = weight[min(n, i0) : min(n, i1)].float()
+            t0 = i0 // bn
+            t1 = i1 // bn
+            chunk = (
+                wf.view(t1 - t0, bn, pk // bk, bk)
+                * sf_tiles[t0:t1, None, :, None]
+            ).reshape(n_pad, pk)
+            dst0 = min(n, i0)
+            dst1 = min(n, i1)
+            if dst1 > dst0:
+                out[dst0:dst1] = chunk[: dst1 - dst0, :k].to(out_dtype)
+    return out
 
 
 def expand_mxfp8_ue8m0_row_scales(

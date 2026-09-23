@@ -24,6 +24,8 @@ from huggingface_hub import snapshot_download
 from sglang.srt.configs import (
     AfmoeConfig,
     BailingHybridConfig,
+    BailingMM2Config,
+    BailingMoeV3VLConfig,
     ChatGLMConfig,
     Cosmos3Config,
     Cosmos3EdgeConfig,
@@ -37,6 +39,7 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    FalconMambaConfig,
     Glm5NextConfig,
     Glm5NextTextConfig,
     GraniteMoeHybridConfig,
@@ -58,6 +61,8 @@ from sglang.srt.configs import (
     LagunaConfig,
     LocateAnythingConfig,
     LongcatFlashConfig,
+    Mamba2Config,
+    MambaConfig,
     MiniCPMHybridConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
@@ -109,6 +114,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     for cls in [
         AfmoeConfig,
         BailingHybridConfig,
+        BailingMM2Config,
+        BailingMoeV3VLConfig,
         ChatGLMConfig,
         DbrxConfig,
         ExaoneConfig,
@@ -133,6 +140,9 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Qwen4ExpConfig,
         Qwen4ExpTextConfig,
         FalconH1Config,
+        FalconMambaConfig,
+        Mamba2Config,
+        MambaConfig,
         GraniteMoeHybridConfig,
         HYV4Config,
         DotsVLMConfig,
@@ -184,6 +194,7 @@ try:
     class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v4"
         hc_pre_from_prev_sublayer = False
+        # V4 normalizes each attention query head (weightless rmsnorm) before RoPE.
         q_head_norm = True
         kv_source_layer_ids = ()
         index_source_layer_ids = ()

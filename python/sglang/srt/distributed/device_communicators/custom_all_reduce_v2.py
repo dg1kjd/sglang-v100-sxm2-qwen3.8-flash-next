@@ -159,6 +159,7 @@ class CustomAllReduceV2:
         priority and override all of the size parameters above.
         """
         self.disabled = True
+        self.pcie_only = False
         if not can_use_custom_all_reduce_v2(group=group, device=device):
             return
 
@@ -175,6 +176,15 @@ class CustomAllReduceV2:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
             max_push_size = int(_FORCE_PUSH_SIZE_KB) * 1024
+        # After FORCE_* so a pull-size override cannot re-enable kernels
+        # that hang on PCIe P2P. Default-off env: this block is a no-op.
+        self.pcie_only = bool(envs.SGLANG_CUSTOM_AR_ALLOW_PCIE.get())
+        if self.pcie_only:
+            max_push_size = min(
+                max_push_size, int(envs.SGLANG_CUSTOM_AR_PCIE_MAX_BYTES.get())
+            )
+            max_pull_size = 0
+            max_pull_blocks = 0
 
         def force_thresholds(heuristic):
             # forced sizes bypass the tuned NCCL-crossover heuristics: lift
@@ -359,6 +369,12 @@ class CustomAllReduceV2:
 
     def _pick_config(self, nbytes: int, can_use_graph: bool) -> AllReduceConfig | None:
         # TODO: refactor this along with the config file
+        # PCIe P2P: pull kernels spin forever. Push beats NCCL only for
+        # small messages; larger sizes return None (NCCL).
+        if self.pcie_only:
+            if nbytes <= self.max_push_size:
+                return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
+            return None
         heuristic = self.config.graph if can_use_graph else self.config.eager
         # Forcing a family must not also bypass the capacity guard: a config
         # returned for a tensor larger than the workspace overruns it inside the
@@ -538,4 +554,7 @@ def can_use_custom_all_reduce_v2(
         supported_world_size=list(supported),
         cls_name="CustomAllReduceV2",
     )
-    return full_nvlink is True
+    if full_nvlink is True:
+        return True
+    # False: P2P works, no full NVLink clique. None: rejected / P2P failed.
+    return full_nvlink is False and envs.SGLANG_CUSTOM_AR_ALLOW_PCIE.get()

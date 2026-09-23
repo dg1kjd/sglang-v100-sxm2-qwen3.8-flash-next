@@ -20,6 +20,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskStatus,
 )
+from sglang.srt.managers.auxiliary_output import CommittedTokens
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_MATCHED_TOKEN,
@@ -44,7 +45,6 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.sampling.sampling_observer import CommittedTokens
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
     )
+    from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
         SchedulerLogprobResultProcessor,
@@ -77,9 +78,26 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
-    from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
 
 logger = logging.getLogger(__name__)
+
+
+def _log_dsv41_prefill_done(req) -> None:
+    """Phase-1 line: how much of this prefill was already cached, and how long it took."""
+    if not envs.SGLANG_DSV41_STICKY_LAST_SEQ.get():
+        return
+    stats = getattr(req, "time_stats", None)
+    start = float(getattr(stats, "forward_entry_time", 0.0) or 0.0)
+    end = float(getattr(stats, "prefill_finished_time", 0.0) or 0.0)
+    prefill_s = (end - start) if start > 0.0 and end >= start else -1.0
+    cached = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
+    prompt = len(getattr(req, "origin_input_ids", ()) or ())
+    logger.info(
+        "dsv41 prefill done cached=%d prompt=%d prefill_s=%.3f",
+        cached,
+        prompt,
+        prefill_s,
+    )
 
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
@@ -343,6 +361,7 @@ class SchedulerBatchResultProcessor:
 
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    _log_dsv41_prefill_done(req)
 
                     if sampling_mask_finish_reason is not None:
                         req.to_finish = sampling_mask_finish_reason
@@ -519,6 +538,7 @@ class SchedulerBatchResultProcessor:
         logits_output: LogitsProcessorOutput,
     ) -> None:
         if batch.return_logprob:
+            logits_output.finalize_input_logprobs()
             if logits_output.next_token_logprobs is not None:
                 logits_output.next_token_logprobs = (
                     logits_output.next_token_logprobs.tolist()

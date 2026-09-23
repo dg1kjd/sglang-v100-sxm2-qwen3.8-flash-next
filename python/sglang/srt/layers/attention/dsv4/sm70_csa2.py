@@ -29,9 +29,11 @@ decode). ``SGLANG_DSV41_TORCH_PREFILL_SPARSE=1`` restores unpack + einsum.
 
 TARGET_VERIFY (T=γ+1) uses the packed decode kernels, one token at a time:
 compress+index in order (B.4c ratio-2 prefix unrolled at static T so the
-graph keeps fixed shapes), then a T-wide ring write and the prefill sparse
-oracle. No ``positions[0].item()``. Chunked prefill stays on the oracle path;
-draft DECODE T>1 also uses that path but skips the host sync while capturing.
+graph keeps fixed shapes), then the prefill sparse oracle over a scratch
+window. The live ring, ratio-2 ``pending_*``, and compressed rows stay on the
+committed prefix until ``sm70_commit_target_verify`` (after accept). No
+``positions[0].item()``. Chunked prefill stays on the oracle path; draft
+DECODE T>1 also uses that path but skips the host sync while capturing.
 """
 
 from __future__ import annotations
@@ -259,6 +261,20 @@ class Sm70Csa2State:
     verify_kv_buf: Dict[int, torch.Tensor] = field(default_factory=dict)
     verify_topk: Dict[int, torch.Tensor] = field(default_factory=dict)
     verify_cand: Optional[torch.Tensor] = None
+    # Target-verify scratch. The forward reads these; commit publishes the
+    # accepted prefix into the live ring / pending / compressed rows.
+    verify_swa_packed: Dict[int, torch.Tensor] = field(default_factory=dict)
+    verify_swa_stage: Optional[torch.Tensor] = None
+    verify_positions: Optional[torch.Tensor] = None
+    verify_open: Optional[torch.Tensor] = None
+    verify_t: Optional[torch.Tensor] = None
+    verify_pending_kv_traj: Dict[int, torch.Tensor] = field(default_factory=dict)
+    verify_pending_score_traj: Dict[int, torch.Tensor] = field(default_factory=dict)
+    verify_pending_kv_cur: Dict[int, torch.Tensor] = field(default_factory=dict)
+    verify_pending_score_cur: Dict[int, torch.Tensor] = field(default_factory=dict)
+    verify_row: Dict[int, torch.Tensor] = field(default_factory=dict)
+    verify_kv_orig: Dict[int, torch.Tensor] = field(default_factory=dict)
+    verify_index_orig: Dict[int, torch.Tensor] = field(default_factory=dict)
     swa_scratch: Dict[int, torch.Tensor] = field(default_factory=dict)
     gather_n: Optional[torch.Tensor] = None
     capture_t: int = 1
@@ -310,6 +326,17 @@ def get_state(backend) -> Sm70Csa2State:
     return st
 
 
+def _graph_buffer(factory, *args, **kwargs):
+    """Tensor CUDA-graph capture may update in place.
+
+    Warmup forwards run under ``torch.inference_mode``. Capture does not, and
+    PyTorch rejects an inplace write to a tensor created there. Opt out for
+    every buffer the captured verify forward writes with ``copy_`` / ``fill_``.
+    """
+    with torch.inference_mode(False):
+        return factory(*args, **kwargs)
+
+
 def _ensure_buffers(st: Sm70Csa2State, layer, topo: dict, device: torch.device, backend=None) -> None:
     """Allocate this layer's static buffers once (never inside a graph capture)."""
     lid = int(layer.layer_id)
@@ -327,40 +354,48 @@ def _ensure_buffers(st: Sm70Csa2State, layer, topo: dict, device: torch.device, 
     tmax = st.capture_t
     bs = st.candidate_block_size
     u8 = dict(dtype=torch.uint8, device=device)
-    st.swa_ring[lid] = torch.zeros((st.sliding_window, SWA_ROW_BYTES), **u8)
-    st.swa_scratch[lid] = torch.zeros(
-        (st.sliding_window + tmax, SWA_ROW_BYTES), **u8
+    st.swa_ring[lid] = _graph_buffer(torch.zeros, (st.sliding_window, SWA_ROW_BYTES), **u8)
+    st.swa_scratch[lid] = _graph_buffer(
+        torch.zeros, (st.sliding_window + tmax, SWA_ROW_BYTES), **u8
     )
     ratio = int(getattr(layer, "compress_ratio", 0) or 0)
     compressor = getattr(layer, "compressor", None)
     if compressor is not None:
         cap_c = compressed_capacity(st.capacity, ratio, bs)
-        st.kv_rows[lid] = torch.zeros((cap_c, KV_ROW_BYTES), **u8)
+        st.kv_rows[lid] = _graph_buffer(torch.zeros, (cap_c, KV_ROW_BYTES), **u8)
         idxer = getattr(layer, "indexer", None)
         if idxer is not None and getattr(idxer, "owns_k", False):
-            st.index_rows[lid] = torch.zeros((cap_c, INDEX_ROW_BYTES), **u8)
+            st.index_rows[lid] = _graph_buffer(torch.zeros, (cap_c, INDEX_ROW_BYTES), **u8)
         if ratio == 2:
-            st.pending_kv[lid] = torch.zeros(layer.head_dim, dtype=torch.float32, device=device)
-            st.pending_score[lid] = torch.zeros(
-                layer.head_dim, dtype=torch.float32, device=device
+            st.pending_kv[lid] = _graph_buffer(
+                torch.zeros, layer.head_dim, dtype=torch.float32, device=device
+            )
+            st.pending_score[lid] = _graph_buffer(
+                torch.zeros, layer.head_dim, dtype=torch.float32, device=device
             )
     if getattr(layer, "indexer", None) is not None:
         k = int(topo["index_topk"])
-        st.topk[lid] = torch.full((1, k), -1, dtype=torch.int32, device=device)
-        st.verify_topk[lid] = torch.full((tmax, k), -1, dtype=torch.int32, device=device)
+        st.topk[lid] = _graph_buffer(
+            torch.full, (1, k), -1, dtype=torch.int32, device=device
+        )
+        st.verify_topk[lid] = _graph_buffer(
+            torch.full, (tmax, k), -1, dtype=torch.int32, device=device
+        )
     if st.logits is None:
         cap_max = compressed_capacity(st.capacity, 1, bs)
-        st.logits = torch.zeros((1, cap_max), dtype=torch.float32, device=device)
+        st.logits = _graph_buffer(torch.zeros, (1, cap_max), dtype=torch.float32, device=device)
         nc = st.candidate_topk_blocks * bs
-        st.logits_c = torch.zeros((1, nc), dtype=torch.float32, device=device)
-        st.cand_ids = torch.full(
-            (1, st.candidate_topk_blocks), -1, dtype=torch.int32, device=device
+        st.logits_c = _graph_buffer(torch.zeros, (1, nc), dtype=torch.float32, device=device)
+        st.cand_ids = _graph_buffer(
+            torch.full, (1, st.candidate_topk_blocks), -1, dtype=torch.int32, device=device
         )
-        st.cand_key_ids = torch.full((1, nc), -1, dtype=torch.int32, device=device)
-        st.cand_offs = torch.arange(bs, device=device, dtype=torch.int32)
-        st.gather_n = torch.full((1,), nc, dtype=torch.int32, device=device)
-        st.verify_cand = torch.full(
-            (tmax, st.candidate_topk_blocks), -1, dtype=torch.int32, device=device
+        st.cand_key_ids = _graph_buffer(
+            torch.full, (1, nc), -1, dtype=torch.int32, device=device
+        )
+        st.cand_offs = _graph_buffer(torch.arange, bs, device=device, dtype=torch.int32)
+        st.gather_n = _graph_buffer(torch.full, (1,), nc, dtype=torch.int32, device=device)
+        st.verify_cand = _graph_buffer(
+            torch.full, (tmax, st.candidate_topk_blocks), -1, dtype=torch.int32, device=device
         )
 
 
@@ -793,8 +828,15 @@ def _decode_pack_swa(layer, kv: torch.Tensor, positions: torch.Tensor, st: Sm70C
     st.swa_ring[lid].index_copy_(0, torch.remainder(positions, w), packed_swa)
 
 
-def _decode_compress_and_index(backend, layer, x, q_lora, positions, topo, st):
-    """T=1 compressor + hierarchical indexer. Does not touch the SWA ring."""
+def _decode_compress_and_index(
+    backend, layer, x, q_lora, positions, topo, st, verify_step: Optional[int] = None
+):
+    """T=1 compressor + hierarchical indexer. Does not touch the SWA ring.
+
+    ``verify_step`` runs the ratio-2 recurrence on a scratch copy of
+    ``pending_*`` and records each compressed row so commit can drop the
+    unaccepted tail. The live pending slot is left unchanged.
+    """
     if getattr(layer, "compressor", None) is None and getattr(layer, "indexer", None) is None:
         return
     lid = int(layer.layer_id)
@@ -817,15 +859,29 @@ def _decode_compress_and_index(backend, layer, x, q_lora, positions, topo, st):
             xf = x.float()
             kv_cur = _matmul_aligned(xf, _weight(comp, "wkv").float().t())
             score_cur = _matmul_aligned(xf, _weight(comp, "wgate").float().t())
-            kv2 = torch.stack([st.pending_kv[lid][None], kv_cur], dim=1)
-            score2 = torch.stack([st.pending_score[lid][None], score_cur], dim=1)
+            if verify_step is None:
+                prev_kv = st.pending_kv[lid]
+                prev_score = st.pending_score[lid]
+            else:
+                prev_kv, prev_score = _verify_pending_prev(st, lid, verify_step)
+            kv2 = torch.stack([prev_kv[None], kv_cur], dim=1)
+            score2 = torch.stack([prev_score[None], score_cur], dim=1)
             pooled = (kv2 * score2.softmax(dim=1)).sum(dim=1)
             latent = _rmsnorm(pooled.to(x.dtype), _weight(comp, "norm"), eps)
-            st.pending_kv[lid].copy_(kv_cur[0])
-            st.pending_score[lid].copy_(score_cur[0])
+            if verify_step is None:
+                prev_kv.copy_(kv_cur[0])
+                prev_score.copy_(score_cur[0])
+            else:
+                _verify_pending_save(st, lid, verify_step, kv_cur, score_cur)
             row = positions // 2
             gfreq = _freqs_for(layer, row * 2, check=False)
             row_div, freq_mul = 2, 2
+        row_idx = None
+        if verify_step is not None:
+            row_idx = row.reshape(-1)[:1].to(dtype=torch.int64)
+            _snap_verify_row(
+                st, lid, verify_step, row_idx, st.kv_rows[lid], st.verify_kv_orig, KV_ROW_BYTES
+            )
         if glue:
             pack_kv_fp4_at(
                 st.kv_rows[lid],
@@ -843,6 +899,19 @@ def _decode_compress_and_index(backend, layer, x, q_lora, positions, topo, st):
         idxer = layer.indexer
         if idxer is not None and getattr(idxer, "owns_k", False):
             ik = _rmsnorm(_linear(latent, idxer.wk.weight), idxer.k_norm.weight, eps)
+            if verify_step is not None:
+                if row_idx is None:
+                    row_idx = row.reshape(-1)[:1].to(dtype=torch.int64)
+                _snap_verify_row(
+                    st,
+                    lid,
+                    verify_step,
+                    row_idx,
+                    st.index_rows[lid],
+                    st.verify_index_orig,
+                    INDEX_ROW_BYTES,
+                    store_index=False,
+                )
             if glue:
                 pack_index_k_at(
                     st.index_rows[lid],
@@ -924,7 +993,8 @@ def _ensure_verify_kv(st: Sm70Csa2State, lid: int, kv: torch.Tensor) -> torch.Te
             raise RuntimeError(
                 f"SM70 CSA2 verify KV buffer missing during capture (L{lid})"
             )
-        st.verify_kv_buf[lid] = torch.empty(
+        st.verify_kv_buf[lid] = _graph_buffer(
+            torch.empty,
             (max(t, st.capture_t),) + tuple(kv.shape[1:]),
             dtype=kv.dtype,
             device=kv.device,
@@ -934,15 +1004,144 @@ def _ensure_verify_kv(st: Sm70Csa2State, lid: int, kv: torch.Tensor) -> torch.Te
     return buf[:t]
 
 
-def _verify_low_ratio_sources(backend, layer, x, q_lora, positions, topo, st):
-    """Packed decode kernels at T=γ+1. SWA ring is written later, T-wide, at sparse.
+def _alloc_verify_buf(existing, t: int, shape, dtype, device, capture_t: int, what: str):
+    if (
+        existing is not None
+        and existing.device == device
+        and existing.dtype == dtype
+        and int(existing.shape[0]) >= t
+        and tuple(existing.shape[1:]) == tuple(shape)
+    ):
+        return existing
+    if _capturing():
+        raise RuntimeError(f"SM70 CSA2 verify {what} missing during capture")
+    return _graph_buffer(
+        torch.empty, (max(t, capture_t),) + tuple(shape), dtype=dtype, device=device
+    )
 
-    Ratio-2 pairing is the T=1 prefix op unrolled over static T (B.4c). A
-    masked unique-row scatter would be a dynamic shape and cannot live in a
-    CUDA graph.
+
+def _note_verify_block(st: Sm70Csa2State, positions: torch.Tensor) -> None:
+    """Record this verify block. Replay fills the same static buffers."""
+    t = int(positions.shape[0])
+    if t <= 0:
+        return
+    device = positions.device
+    if positions.dtype != torch.int64:
+        positions = positions.to(dtype=torch.int64)
+    st.verify_positions = _alloc_verify_buf(
+        st.verify_positions, t, (), torch.int64, device, st.capture_t, "positions"
+    )
+    st.verify_positions[:t].copy_(positions[:t])
+    if (
+        st.verify_open is None
+        or st.verify_open.device != device
+        or st.verify_t is None
+        or st.verify_t.device != device
+    ):
+        if _capturing():
+            raise RuntimeError("SM70 CSA2 verify commit flag missing during capture")
+        st.verify_open = _graph_buffer(torch.zeros, 1, dtype=torch.int32, device=device)
+        st.verify_t = _graph_buffer(torch.zeros, 1, dtype=torch.int32, device=device)
+    st.verify_t.fill_(t)
+    st.verify_open.fill_(1)
+
+
+def _verify_pending_prev(st: Sm70Csa2State, lid: int, step: int):
+    """Scratch previous-token projection. Step 0 copies the live slot."""
+    live_kv = st.pending_kv[lid]
+    device = live_kv.device
+    dim = int(live_kv.shape[0])
+    need = max(step + 1, _CAPTURE_T_MAX)
+    st.verify_pending_kv_traj[lid] = _alloc_verify_buf(
+        st.verify_pending_kv_traj.get(lid),
+        need,
+        (dim,),
+        torch.float32,
+        device,
+        st.capture_t,
+        "pending kv",
+    )
+    st.verify_pending_score_traj[lid] = _alloc_verify_buf(
+        st.verify_pending_score_traj.get(lid),
+        need,
+        (dim,),
+        torch.float32,
+        device,
+        st.capture_t,
+        "pending score",
+    )
+    cur_kv = st.verify_pending_kv_cur.get(lid)
+    if cur_kv is None or cur_kv.device != device or int(cur_kv.shape[0]) != dim:
+        if _capturing():
+            raise RuntimeError("SM70 CSA2 verify pending cursor missing during capture")
+        cur_kv = _graph_buffer(torch.empty, dim, dtype=torch.float32, device=device)
+        cur_score = _graph_buffer(torch.empty, dim, dtype=torch.float32, device=device)
+        st.verify_pending_kv_cur[lid] = cur_kv
+        st.verify_pending_score_cur[lid] = cur_score
+    cur_score = st.verify_pending_score_cur[lid]
+    if step == 0:
+        cur_kv.copy_(live_kv)
+        cur_score.copy_(st.pending_score[lid])
+    return cur_kv, cur_score
+
+
+def _verify_pending_save(st: Sm70Csa2State, lid: int, step: int, kv_cur, score_cur) -> None:
+    """Remember this token's projection and advance the scratch cursor."""
+    st.verify_pending_kv_traj[lid][step].copy_(kv_cur[0])
+    st.verify_pending_score_traj[lid][step].copy_(score_cur[0])
+    st.verify_pending_kv_cur[lid].copy_(kv_cur[0])
+    st.verify_pending_score_cur[lid].copy_(score_cur[0])
+
+
+def _snap_verify_row(
+    st: Sm70Csa2State,
+    lid: int,
+    step: int,
+    row_idx: torch.Tensor,
+    table: torch.Tensor,
+    orig_store: Dict[int, torch.Tensor],
+    nbytes: int,
+    store_index: bool = True,
+) -> None:
+    """Bytes in ``table[row]`` before this step's write, so commit can peel it."""
+    device = table.device
+    need = max(step + 1, _CAPTURE_T_MAX)
+    orig = _alloc_verify_buf(
+        orig_store.get(lid),
+        need,
+        (nbytes,),
+        torch.uint8,
+        device,
+        st.capture_t,
+        "row snapshot",
+    )
+    orig_store[lid] = orig
+    if store_index:
+        rows = _alloc_verify_buf(
+            st.verify_row.get(lid),
+            need,
+            (),
+            torch.int64,
+            device,
+            st.capture_t,
+            "row index",
+        )
+        st.verify_row[lid] = rows
+        rows[step].copy_(row_idx.reshape(()).to(dtype=torch.int64))
+    orig[step].copy_(table.index_select(0, row_idx.reshape(1)).reshape(-1))
+
+
+def _verify_low_ratio_sources(backend, layer, x, q_lora, positions, topo, st):
+    """Packed decode kernels at T=γ+1. The live SWA ring is not written here.
+
+    Ratio-2 pairing is the T=1 prefix op unrolled over static T (B.4c), against
+    a scratch copy of ``pending_*``. A masked unique-row scatter would be a
+    dynamic shape and cannot live in a CUDA graph. Commit peels the unaccepted
+    tail after accept.
     """
     lid = int(layer.layer_id)
     t = int(x.shape[0])
+    _note_verify_block(st, positions[:t])
     st.verify_kv[lid] = _ensure_verify_kv(st, lid, _project_swa_kv(layer, x))
     idxer = getattr(layer, "indexer", None)
     is_src = bool(getattr(idxer, "is_candidate_source", False))
@@ -955,7 +1154,9 @@ def _verify_low_ratio_sources(backend, layer, x, q_lora, positions, topo, st):
                     f"SM70 CSA2 verify topk buffer missing during capture (L{lid})"
                 )
             k = int(topo["index_topk"])
-            topk_buf = torch.full((max(t, st.capture_t), k), -1, dtype=torch.int32, device=x.device)
+            topk_buf = _graph_buffer(
+                torch.full, (max(t, st.capture_t), k), -1, dtype=torch.int32, device=x.device
+            )
             st.verify_topk[lid] = topk_buf
         st.prefill_topk[lid] = topk_buf[:t]
     if is_src:
@@ -964,8 +1165,12 @@ def _verify_low_ratio_sources(backend, layer, x, q_lora, positions, topo, st):
         if cand is None or int(cand.shape[0]) < t:
             if _capturing():
                 raise RuntimeError("SM70 CSA2 verify cand buffer missing during capture")
-            cand = torch.full(
-                (max(t, st.capture_t), nblk), -1, dtype=torch.int32, device=x.device
+            cand = _graph_buffer(
+                torch.full,
+                (max(t, st.capture_t), nblk),
+                -1,
+                dtype=torch.int32,
+                device=x.device,
             )
             st.verify_cand = cand
         st.prefill_cand_ids = cand[:t]
@@ -980,7 +1185,14 @@ def _verify_low_ratio_sources(backend, layer, x, q_lora, positions, topo, st):
             st.cand_ids.copy_(ids[i : i + 1])
         q_i = None if q_lora is None else q_lora[i : i + 1]
         _decode_compress_and_index(
-            backend, layer, x[i : i + 1], q_i, positions[i : i + 1], topo, st
+            backend,
+            layer,
+            x[i : i + 1],
+            q_i,
+            positions[i : i + 1],
+            topo,
+            st,
+            verify_step=i,
         )
         if idxer is not None:
             st.prefill_topk[lid][i].copy_(st.topk[lid][0])
@@ -1023,6 +1235,67 @@ def _decode_sparse_one(
     return cuda_sparse_decode(q_i, ring, kv_q, valid_s, valid_k, sink[:h], scale)
 
 
+def _pack_verify_swa(
+    layer, kv: torch.Tensor, positions: torch.Tensor, st: Sm70Csa2State, lid: int
+) -> torch.Tensor:
+    """Pack this block with the decode packer. Does not write the live ring.
+
+    Glue packs into a window-sized stage (the block is shorter than the window,
+    so slots do not collide) and the dense rows are copied out for commit.
+    """
+    t = int(kv.shape[0])
+    rope_dim = int(layer.qk_rope_head_dim)
+    w = st.sliding_window
+    device = kv.device
+    st.verify_swa_packed[lid] = _alloc_verify_buf(
+        st.verify_swa_packed.get(lid),
+        max(t, _CAPTURE_T_MAX),
+        (SWA_ROW_BYTES,),
+        torch.uint8,
+        device,
+        st.capture_t,
+        "packed swa",
+    )
+    if _attn_glue_on():
+        stage = st.verify_swa_stage
+        if (
+            stage is None
+            or stage.device != device
+            or int(stage.shape[0]) != w
+            or int(stage.shape[1]) != SWA_ROW_BYTES
+        ):
+            if _capturing():
+                raise RuntimeError("SM70 CSA2 verify SWA stage missing during capture")
+            stage = _graph_buffer(
+                torch.empty, (w, SWA_ROW_BYTES), dtype=torch.uint8, device=device
+            )
+            st.verify_swa_stage = stage
+        pack_swa_fp8_at(
+            stage,
+            kv,
+            positions,
+            freqs_table=_freqs_table(layer),
+            rope_dim=rope_dim,
+            dst_mod=w,
+        )
+        slots = torch.remainder(positions.to(dtype=torch.int64), w)
+        packed = stage.index_select(0, slots)
+    else:
+        packed = pack_swa_fp8(
+            kv, _freqs_for(layer, positions, check=False), rope_dim
+        )
+    st.verify_swa_packed[lid][:t].copy_(packed)
+    return st.verify_swa_packed[lid][:t]
+
+
+def _gather_verify_swa(
+    st: Sm70Csa2State, lid: int, packed: torch.Tensor, positions: torch.Tensor
+):
+    """Causal window: committed ring history, then this block. Query i stops at i."""
+    buf, origin = _prefill_swa_view(st, lid, positions[:1], packed)
+    return _gather_swa(st, buf, origin, positions)
+
+
 def _verify_sparse(
     q: torch.Tensor,
     layer,
@@ -1035,20 +1308,22 @@ def _verify_sparse(
     scale: float,
     h: int,
 ) -> torch.Tensor:
-    """Pack SWA with the prefill packer, then the prefill oracle (not decode sparse).
+    """Score the block against a scratch SWA window, then the prefill oracle.
 
-    Packed decode kernels are still used for compress+index (ratio-2 pairing in
-    order, no draft leak into row 0). The scored bonus token must match EXTEND
-    last-row, which uses ``sparse_attention_rows``, not ``cuda_sparse_decode``.
+    The live ring is not updated here. A direct ring gather aliases the next
+    few draft positions onto slots that are still inside the 128-token window.
+    Commit writes only the accepted prefix. The scored bonus token must match
+    EXTEND last-row, which uses ``sparse_attention_rows``.
     """
     kv = st.verify_kv.pop(lid)
     attn = st.layers.get(lid)
     if attn is None:
         raise RuntimeError(f"SM70 CSA2 verify sparse ran before low-ratio sources (L{lid})")
     t = int(q.shape[0])
+    _note_verify_block(st, positions[:t])
     topk = st.prefill_topk.get(idx_src) if idx_src is not None else None
-    _decode_pack_swa(attn, kv, positions, st, lid)
-    tile_rows, valid = _gather_swa_from_ring(st, lid, positions)
+    packed = _pack_verify_swa(attn, kv, positions, st, lid)
+    tile_rows, valid = _gather_verify_swa(st, lid, packed, positions)
     payload, scales = tile_rows[..., :HEAD_DIM], tile_rows[..., HEAD_DIM:]
     keys = unpack_swa_fp8_ue8m0(payload, scales, q.dtype)
     if kv_src is not None and topk is not None and topk.shape[1] > 0:
@@ -1062,6 +1337,125 @@ def _verify_sparse(
             keys = torch.cat([keys, kv_u], dim=1)
             valid = torch.cat([valid, ci >= 0], dim=1)
     return _sparse_attention_rows_aligned(q, keys, valid, sink[:h], scale)
+
+
+def _peel_uncommitted_rows(
+    table: torch.Tensor,
+    orig: torch.Tensor,
+    rows: torch.Tensor,
+    n: torch.Tensor,
+    t: int,
+    open_flag: torch.Tensor,
+    limit: torch.Tensor,
+) -> None:
+    """Undo verify writes from the end. ``orig[i]`` is the row before step i.
+
+    Peeling an unaccepted odd step restores the incomplete pair the accepted
+    even step wrote. Peeling both steps restores the pre-block row.
+    """
+    n = n.reshape(())
+    limit = limit.reshape(())
+    open_flag = open_flag.reshape(())
+    for i in range(t - 1, -1, -1):
+        row = rows[i].to(dtype=torch.int64).reshape(1)
+        current = table.index_select(0, row)
+        peel = (i >= n) & (i < limit) & (open_flag != 0)
+        src = torch.where(peel.reshape(1, 1), orig[i].reshape(1, -1), current)
+        table.index_copy_(0, row, src)
+
+
+def _commit_pending_vec(
+    live: torch.Tensor,
+    traj: torch.Tensor,
+    n: torch.Tensor,
+    t: int,
+    open_flag: torch.Tensor,
+    limit: torch.Tensor,
+) -> None:
+    """Pending becomes the last committed input. n == 0 leaves the live slot."""
+    if t <= 0:
+        return
+    last = (n.reshape(()) - 1).clamp(min=0, max=t - 1).to(dtype=torch.int64)
+    chosen = traj.index_select(0, last.reshape(1)).reshape(-1)
+    use = (n.reshape(()) > 0) & (open_flag.reshape(()) != 0) & (limit.reshape(()) > 0)
+    live.copy_(torch.where(use, chosen, live))
+
+
+def _commit_swa_prefix(
+    ring: torch.Tensor,
+    packed: torch.Tensor,
+    positions: torch.Tensor,
+    n: torch.Tensor,
+    t: int,
+    w: int,
+    open_flag: torch.Tensor,
+    limit: torch.Tensor,
+) -> None:
+    """Write packed rows for the accepted inputs. The block is shorter than W."""
+    if t <= 0:
+        return
+    pos = positions[:t].to(dtype=torch.int64)
+    slots = torch.remainder(pos, w)
+    idx = torch.arange(t, device=ring.device)
+    pred = (idx < n.reshape(())) & (idx < limit.reshape(())) & (open_flag.reshape(()) != 0)
+    current = ring.index_select(0, slots)
+    src = torch.where(pred.unsqueeze(-1), packed[:t], current)
+    # Consecutive positions in a window do not share a slot. A longer block
+    # writes one row at a time so a later accepted token wins over an earlier one.
+    if t <= w:
+        ring.index_copy_(0, slots, src)
+        return
+    for i in range(t):
+        slot = slots[i].reshape(1)
+        current_i = ring.index_select(0, slot)
+        src_i = torch.where(pred[i].reshape(1, 1), packed[i].reshape(1, -1), current_i)
+        ring.index_copy_(0, slot, src_i)
+
+
+def sm70_commit_target_verify(backend, commit_lens: torch.Tensor, num_positions: int) -> None:
+    """Publish the accepted verify prefix into the live CSA2 state.
+
+    ``commit_lens`` counts the anchor plus accepted drafts (the bonus has no
+    key yet). Inputs at ``i >= commit_lens`` are dropped. A second call is a
+    no-op until the next verify forward.
+    """
+    st = getattr(backend, "_sm70_csa2", None)
+    if st is None or st.verify_open is None or st.verify_positions is None or st.verify_t is None:
+        return
+    t = int(num_positions)
+    if t <= 0 or commit_lens is None or commit_lens.numel() == 0:
+        return
+    n = commit_lens.reshape(-1)[:1]
+    open_flag = st.verify_open
+    limit = st.verify_t
+    positions = st.verify_positions
+    for lid, orig in st.verify_kv_orig.items():
+        rows = st.verify_row.get(lid)
+        table = st.kv_rows.get(lid)
+        if rows is None or table is None:
+            continue
+        _peel_uncommitted_rows(table, orig, rows, n, t, open_flag, limit)
+    for lid, orig in st.verify_index_orig.items():
+        rows = st.verify_row.get(lid)
+        table = st.index_rows.get(lid)
+        if rows is None or table is None:
+            continue
+        _peel_uncommitted_rows(table, orig, rows, n, t, open_flag, limit)
+    for lid, traj in st.verify_pending_kv_traj.items():
+        live = st.pending_kv.get(lid)
+        if live is not None:
+            _commit_pending_vec(live, traj, n, t, open_flag, limit)
+    for lid, traj in st.verify_pending_score_traj.items():
+        live = st.pending_score.get(lid)
+        if live is not None:
+            _commit_pending_vec(live, traj, n, t, open_flag, limit)
+    w = int(st.sliding_window)
+    for lid, ring in st.swa_ring.items():
+        packed = st.verify_swa_packed.get(lid)
+        if packed is None:
+            continue
+        _commit_swa_prefix(ring, packed, positions, n, t, w, open_flag, limit)
+    st.verify_open.fill_(0)
 
 
 # --------------------------------------------------------------------------- #

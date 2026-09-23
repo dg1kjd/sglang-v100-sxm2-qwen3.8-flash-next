@@ -13,8 +13,9 @@
 #   FLASH_NEXT_MODEL=/path/to/Qwen3.8-Flash-Next-NVFP4   (required)
 #   SGLANG_V100_VENV=/path/to/venv                       (default: $HOME/sglang-v100-venv)
 #   FLASH_NEXT_GPUS=0,1,2,3    (one 4-GPU NVLink domain)
-#   FLASH_NEXT_PORT=30000
-#   FLASH_NEXT_HOST=127.0.0.1  (0.0.0.0 to expose it)
+#   SGLANG_V100_HOST=0.0.0.0          (shared with DSV41)
+#   SGLANG_V100_PORT=11435            (shared with DSV41; not 30000)
+#   FLASH_NEXT_HOST / FLASH_NEXT_PORT  (legacy aliases for the same pair)
 #   FLASH_NEXT_DP=1            (data-parallel replicas; needs 4 GPUs each)
 set -euo pipefail
 
@@ -58,6 +59,9 @@ export TORCH_CUDA_ARCH_LIST=7.0
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export NCCL_P2P_LEVEL=NVL
 export SGLANG_CUSTOM_ALLREDUCE_ALGO=1stage
+# 4x V100 PCIe-only (no NVLink, P2P via one PLX): NCCL_P2P_LEVEL=PXB and
+# SGLANG_CUSTOM_AR_ALLOW_PCIE=1 (default off; one-shot push, 128 KiB cap).
+# Do not set that on this 8x V100 hybrid NVLink mesh.
 export SGLANG_MAMBA_CONV_DTYPE=float16
 export SGLANG_MAMBA_SSM_DTYPE=float16
 export SGLANG_SM70_FORCE_FP16=1
@@ -68,7 +72,12 @@ export SGLANG_SM70_QWEN_FUSIONS=1
 export SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS=8192
 export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
 export SGLANG_NUMA_BIND_V2=0
+# V100 runtime pin is sglang-kernel 0.4.6.post1, not upstream 0.4.7.
+export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK="${SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK:-1}"
 export PYTHONPATH="$REPO/python"
+# hicache_storage.py defaults to /tmp/hicache. On this box /tmp is tmpfs, so an
+# unset dir is a RAM allocation. Keep the file tier on disk.
+export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="${SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR:-$HOME/hicache_storage}"
 
 # Docker-v2 tested sizing (README: 4 live requests, full 262K context)
 args=(
@@ -96,8 +105,8 @@ args=(
   # replica 1 -> GPUs 4-7, both under ONE front-end (built-in load balancing).
   # dp-size 1 is the no-op default, so this is inert unless FLASH_NEXT_DP>1.
   --dp-size "${FLASH_NEXT_DP:-1}"
-  --host "${FLASH_NEXT_HOST:-127.0.0.1}"
-  --port "${FLASH_NEXT_PORT:-30000}"
+  --host "${SGLANG_V100_HOST:-${FLASH_NEXT_HOST:-0.0.0.0}}"
+  --port "${SGLANG_V100_PORT:-${FLASH_NEXT_PORT:-11435}}"
   # 0.86 (was 0.88): fp16 QSA KV is the decision of record (fast decode kernel).
   # The 2026-09-11 reliability hammer OOM-crashed the engine at 0.88 under
   # beyond-spec load (32k-token contexts, np=8): free device memory fell to

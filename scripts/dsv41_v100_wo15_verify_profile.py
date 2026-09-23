@@ -45,7 +45,7 @@ def chat(base: str, messages: list[dict[str, str]], max_tokens: int) -> dict[str
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--base", default="http://127.0.0.1:30000")
+    p.add_argument("--base", default="http://127.0.0.1:11435")
     p.add_argument("--num-verify", type=int, default=3)
     args = p.parse_args()
     base = args.base.rstrip("/")

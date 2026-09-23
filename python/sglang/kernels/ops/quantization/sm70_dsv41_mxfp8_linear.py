@@ -3,11 +3,15 @@
 Decode M<=4 is a packed GEMV. Prefill M>4 dequants into a transient fp16
 weight and uses ``F.linear``. marlin_v100 FP8 has no group-32; this is not
 Marlin W8A16.
+
+Engram ``wkv`` layers can stash the fp16 unpack on ``owner._sm70_prefill_fp16_w``
+so a 2048-token chunked prefill does not re-allocate ~300 MiB against a
+fragmented caching allocator.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +28,7 @@ if TYPE_CHECKING:
 
 _K_MAX_M = 4
 _K_GROUP = 32
+_PREFILL_UNPACK_HEADROOM_B = 1024 * 1024 * 1024
 
 
 @cache_once
@@ -54,11 +59,26 @@ def _pad_m(m: int) -> int:
     return 4
 
 
+def _dequant_fp16(
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    if torch.cuda.is_available():
+        free_b, _ = torch.cuda.mem_get_info()
+        if free_b < _PREFILL_UNPACK_HEADROOM_B:
+            torch.cuda.empty_cache()
+    return dequant_mxfp8_ue8m0_to_fp16(
+        weight, scales, (1, 32), out_dtype=out_dtype
+    )
+
+
 def sm70_dsv41_mxfp8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
     scales: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
+    owner: Any = None,
 ) -> torch.Tensor:
     """``F.linear``-shaped MXFP8: y = x @ W.dequant.T + bias."""
     if isinstance(x, tuple):
@@ -115,9 +135,9 @@ def sm70_dsv41_mxfp8_linear(
             y = y + bias.to(dtype=y.dtype)
         return y.view(out_shape)
 
-    fp16_w = dequant_mxfp8_ue8m0_to_fp16(
-        weight, scales, (1, 32), out_dtype=x.dtype
-    )
+    fp16_w = getattr(owner, "_sm70_prefill_fp16_w", None) if owner is not None else None
+    if fp16_w is None:
+        fp16_w = _dequant_fp16(weight, scales, x.dtype)
     # Pad M so T=6 TARGET_VERIFY and T=25 EXTEND share one F.linear tile.
     # Decode M<=4 stays on GEMV above and is not padded.
     mp = (m + 31) // 32 * 32

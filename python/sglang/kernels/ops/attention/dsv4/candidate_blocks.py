@@ -1,4 +1,4 @@
-"""Candidate-block scores and visibility masking for paged indexer logits."""
+"""Candidate-block scores, visibility masking, and sparse-row lengths for the paged indexer."""
 
 import torch
 import triton
