@@ -137,6 +137,11 @@ fi
 # conversation, drops the pin and prefills from 0. /health does not.
 GRAPH_FLAGS+=(--disable-radix-cache)
 export SGLANG_DSV41_STICKY_LAST_SEQ="${SGLANG_DSV41_STICKY_LAST_SEQ:-1}"
+# N open conversations on SSD. One image stays on the GPU. Unset the dir
+# to keep the single resident pin only. Not on tmpfs: a full image is
+# ~225 MiB per rank.
+export SGLANG_DSV41_CSA2_SESSION_DIR="${SGLANG_DSV41_CSA2_SESSION_DIR:-$HOME/work/csa2-sessions}"
+export SGLANG_DSV41_CSA2_SESSION_KEEP="${SGLANG_DSV41_CSA2_SESSION_KEEP:-4}"
 
 # Optional Nsight wrap. Capture starts at cudaProfilerStart (HTTP /start_profile
 # activities=["CUDA_PROFILER"]). Stacks/sample off: they segfaulted on this box.

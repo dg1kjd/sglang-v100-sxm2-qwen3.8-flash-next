@@ -12,10 +12,10 @@ at position 511, layer 2). The scheduler only returns a prefix the worker has
 snapshotted, and the worker copies the ring and pending back before the
 forward.
 
-Host snaps are capped (see ``evict_recent``). Phase 3 (a second conversation,
-or a snap that survives process restart) is not this module: a position-0
-prefill clears the store, because that forward overwrites the compressed rows
-the snaps belong to.
+Host snaps are capped (see ``evict_recent``). A position-0 prefill still
+clears this store. When ``SGLANG_DSV41_CSA2_SESSION_DIR`` is set, that clear
+first spills the image and may load a different saved conversation; see
+``sm70_csa2_session``.
 """
 
 from __future__ import annotations
@@ -237,6 +237,47 @@ def _store(backends: Sequence) -> Optional[Csa2BoundaryStore]:
     return store
 
 
+def _file_spill_under_pin(store: Csa2BoundaryStore, key: str) -> None:
+    """Name the verify image with the scheduler pin before it is written out.
+
+    A DSpark accept leaves the worker tip 1 or 2 tokens past the pin. The
+    next resident extend files that image under the pin. A session switch
+    spills first, so the file would otherwise omit the pin length and the
+    resume would raise ``restore missed length``.
+    """
+    from sglang.srt.layers.attention.dsv4.sm70_csa2_session import load_meta
+
+    meta = load_meta(key)
+    pin = len(meta.get("ids") or []) if meta else 0
+    if pin > 0 and store._verify_tip_is_pin_slack(pin):
+        logger.info(
+            "csa2 boundary file verify snap %d under pin %d before spill",
+            store.tip_len,
+            pin,
+        )
+        store.relabel_tip(pin)
+    if store.tip_len > 0:
+        store.freeze_tip()
+    if pin <= 0 or pin in store.history or pin == store.resident_end:
+        return
+    longer = [n for n in store.order if n > pin]
+    if len(longer) != 1:
+        return
+    worker_len = longer[0]
+    if any(pin < n < worker_len for n in store.order):
+        return
+    snap = store.history.get(worker_len)
+    if not snap:
+        return
+    store.history[pin] = store.history.pop(worker_len)
+    store.order = [pin if n == worker_len else n for n in store.order]
+    if store.resident_end == worker_len:
+        store.resident_end = pin
+    if store.tip_len == worker_len:
+        store.tip_len = pin
+    logger.info("csa2 boundary move snap %d onto pin %d", worker_len, pin)
+
+
 def csa2_prepare_extend(backends: Sequence, start: int) -> None:
     """Call before an extend forward. ``start`` is the cached prefix length."""
     if _capturing():
@@ -245,6 +286,17 @@ def csa2_prepare_extend(backends: Sequence, start: int) -> None:
     if store is None:
         return
     start = int(start)
+    paired = _paired(backends)
+    from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+        load_resident,
+        save_resident,
+        take_handoff,
+    )
+
+    spill, load = take_handoff()
+    if spill and paired:
+        _file_spill_under_pin(store, spill)
+        save_resident(paired, store, spill)
     if start <= 0:
         if store.resident_end or store.history or store.tip_len:
             logger.info(
@@ -253,9 +305,13 @@ def csa2_prepare_extend(backends: Sequence, start: int) -> None:
             )
         store.clear()
         return
-    paired = _paired(backends)
     if not paired:
         return
+    if load:
+        if not load_resident(paired, store, load):
+            raise RuntimeError(
+                f"CSA2 session load missed key {load[:12]} at prefix {start}"
+            )
     # A verify image is named with prefix+commit, which counts bonus positions
     # the scheduler pin does not. The gap was +1 on the first resumed turn and
     # +2 on the next (pin 23696, tip 23698). File that image under the pin

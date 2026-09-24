@@ -14,8 +14,10 @@ length. An aborted chunked prefill keeps that last snap as the pin, so a
 retry of the same prompt extends the tail instead of clearing the image.
 The worker restores the SWA ring and ratio-2 pending for that stop; see
 ``sm70_csa2_boundary``. Any other shape is a miss: drop the pin and
-full-prefill, which also clears the boundary store. No ``session_id``. Do not
-wrap when streaming-session is on.
+full-prefill, which also clears the boundary store. When
+``SGLANG_DSV41_CSA2_SESSION_DIR`` is set, the miss first spills that
+conversation and may resume a different saved one at a recorded stop.
+No ``session_id``. Do not wrap when streaming-session is on.
 """
 
 import logging
@@ -157,35 +159,38 @@ class StickyLastSequenceCache(BasePrefixCache):
         return self.inner.match_prefix(params)
 
     def _try_hit(self, params: MatchPrefixParams) -> Optional[MatchResult]:
-        if self._slot is None or self._last_ids is None:
-            return None
         # /health and /health_generate use a 1-token dummy that is never an
         # exact continuation of a real chat. Dropping the pin on that miss
         # forces the next Claude Code turn to full-prefill (and can OOM).
         if is_health_check_generate_req(params.req):
             return None
+        key = params.key
+        new_ids = key.raw_token_ids()
+        if self._slot is None or self._last_ids is None:
+            return self._match_saved_session(params, new_ids)
         if not self._slot.kv.holds_kv:
             self._clear_pin()
-            return None
+            return self._match_saved_session(params, new_ids)
 
-        key = params.key
         extra_ok = key.extra_key == self._last_extra_key
         salt_ok = (key.cache_salt or None) == self._last_cache_salt
-        new_ids = key.raw_token_ids()
         exact = extra_ok and salt_ok and _is_exact_continuation(new_ids, self._last_ids)
         prefix_len = len(self._last_ids) if exact else 0
         if not exact and extra_ok and salt_ok:
             prefix_len = _longest_cut(self._cuts, new_ids, self._last_ids)
         if prefix_len <= 0:
-            logger.info(
-                "sticky last-seq event=miss pinned=%d new=%d prefix=0 extend=%d cuts=%s",
-                len(self._last_ids),
-                len(new_ids),
-                len(new_ids),
-                self._cuts,
-            )
-            self._drop_slot("miss")
-            return None
+            saved = self._match_saved_session(params, new_ids)
+            if saved is None:
+                logger.info(
+                    "sticky last-seq event=miss pinned=%d new=%d prefix=0 extend=%d cuts=%s",
+                    len(self._last_ids),
+                    len(new_ids),
+                    len(new_ids),
+                    self._cuts,
+                )
+                self._drop_slot("miss")
+                return None
+            return saved
 
         req = params.req
         if req is None:
@@ -388,6 +393,158 @@ class StickyLastSequenceCache(BasePrefixCache):
         if self._slot is not None and self._slot.kv.holds_kv:
             return
         self.inner.sanity_check()
+
+    def _match_saved_session(self, params: MatchPrefixParams, new_ids):
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+            image_ready,
+            list_sessions,
+            load_meta,
+            remember,
+            request_spill,
+            session_key,
+            sessions_enabled,
+        )
+
+        key = params.key
+
+        if not sessions_enabled():
+            return None
+        current = None
+        if self._last_ids:
+            current = session_key(
+                self._last_ids, self._last_extra_key, self._last_cache_salt
+            )
+            remember(
+                current,
+                self._last_ids,
+                self._cuts,
+                self._last_extra_key,
+                self._last_cache_salt,
+            )
+            request_spill(current)
+        best_key = None
+        best_len = 0
+        for record in list_sessions():
+            rec_key = record.get("key")
+            if not rec_key or rec_key == current or not image_ready(rec_key):
+                continue
+            if (record.get("extra_key") or None) != (key.extra_key or None):
+                continue
+            if (record.get("cache_salt") or None) != (key.cache_salt or None):
+                continue
+            ids = tuple(int(token) for token in record.get("ids") or [])
+            cuts = [int(cut) for cut in record.get("cuts") or []]
+            if _is_exact_continuation(new_ids, ids):
+                length = len(ids)
+            else:
+                length = _longest_cut(cuts, new_ids, ids)
+            if length > best_len:
+                best_len = length
+                best_key = rec_key
+        if best_key is None:
+            return None
+        adopted = self._adopt_saved(best_key, best_len, params)
+        if adopted is None:
+            return None
+        meta = load_meta(best_key)
+        if meta is None:
+            return None
+        return adopted
+
+    def _adopt_saved(self, saved_key: str, prefix_len: int, params: MatchPrefixParams):
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+            load_meta,
+            request_load,
+        )
+
+        req = params.req
+        meta = load_meta(saved_key)
+        if req is None or meta is None or prefix_len <= 0:
+            return None
+        if not self._ensure_slot(prefix_len):
+            return None
+        request_load(saved_key)
+        self._slot.restore_to_req(req)
+        self._free_tail(req.kv, prefix_len)
+        self._last_ids = tuple(int(token) for token in meta.get("ids") or [])
+        self._cuts = [
+            int(cut) for cut in meta.get("cuts") or [] if 0 < int(cut) <= prefix_len
+        ]
+        self._last_extra_key = meta.get("extra_key")
+        self._last_cache_salt = meta.get("cache_salt") or None
+        device_indices = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :prefix_len
+        ].to(dtype=torch.int64)
+        logger.info(
+            "sticky last-seq event=session pinned=%d new=%d prefix=%d extend=%d cuts=%s",
+            len(self._last_ids),
+            len(params.key.raw_token_ids()),
+            prefix_len,
+            max(0, len(params.key.raw_token_ids()) - prefix_len),
+            self._cuts,
+        )
+        return MatchResult(
+            device_indices=device_indices,
+            last_device_node=self._slot.virtual_node,
+            last_host_node=self._slot.virtual_node,
+            best_match_node=self._slot.virtual_node,
+            cache_protected_len=0,
+        )
+
+    def _ensure_slot(self, prefix_len: int) -> bool:
+        slot = self._slot
+        if slot is not None and slot.kv.holds_kv:
+            if slot.kv.kv_allocated_len >= prefix_len:
+                return True
+            if self.page_size != 1:
+                return False
+            need = prefix_len - int(slot.kv.kv_allocated_len)
+            indices = self.token_to_kv_pool_allocator.alloc(need)
+            if indices is None:
+                return False
+            row = self.req_to_token_pool.req_to_token[slot.kv.req_pool_idx]
+            if int(row.shape[0]) < prefix_len:
+                return False
+            flat = indices.reshape(-1)
+            start = int(slot.kv.kv_allocated_len)
+            row[start:prefix_len] = flat[:need].to(dtype=row.dtype, device=row.device)
+            slot.kv.kv_allocated_len = prefix_len
+            return True
+        return self._alloc_slot(prefix_len)
+
+    def _alloc_slot(self, prefix_len: int) -> bool:
+        if self.page_size != 1 or prefix_len <= 0:
+            return False
+        pool = self.req_to_token_pool
+        alloc_rows = getattr(pool, "alloc_rows", None)
+        free_rows = getattr(pool, "free_rows", None)
+        if alloc_rows is None:
+            return False
+        rows = alloc_rows(1)
+        if not rows:
+            return False
+        idx = int(rows[0])
+        indices = self.token_to_kv_pool_allocator.alloc(prefix_len)
+        if indices is None:
+            if free_rows is not None:
+                free_rows([idx])
+            return False
+        row = pool.req_to_token[idx]
+        flat = indices.reshape(-1)
+        if int(row.shape[0]) < prefix_len or int(flat.shape[0]) < prefix_len:
+            if free_rows is not None:
+                free_rows([idx])
+            return False
+        row[:prefix_len] = flat[:prefix_len].to(dtype=row.dtype, device=row.device)
+        self._slot = _Slot()
+        self._slot.kv = ReqKvInfo(
+            req_pool_idx=idx,
+            kv_committed_len=prefix_len,
+            kv_allocated_len=prefix_len,
+            swa_evicted_seqlen=0,
+            cache_protected_len=0,
+        )
+        return True
 
     def _clear_pin(self) -> None:
         self._slot = None

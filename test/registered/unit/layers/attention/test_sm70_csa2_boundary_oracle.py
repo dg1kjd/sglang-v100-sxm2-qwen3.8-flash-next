@@ -352,6 +352,53 @@ class TestSm70Csa2BoundaryOracle(CustomTestCase):
         )
         self._check_topk(get_state(ref_be), get_state(be), f"verify commit={commit_n}")
 
+    def test_disk_session_then_suffix_matches_oneshot(self):
+        """Spill the image, clobber it, load it, then extend the real suffix."""
+        import tempfile
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+            request_load,
+            request_spill,
+            reset_handoff,
+            session_key,
+        )
+
+        stop, suffix = 701, 32
+        end = stop + suffix
+        ref_be = self._backend()
+        ref = self._extend(ref_be, self._layers(), 0, end)
+        be = self._backend()
+        layers = self._layers()
+        self._extend(be, layers, 0, stop)
+        csa2_finish_forward([be], stop, from_extend=True)
+        csa2_prepare_extend([be], stop)
+        directory = tempfile.mkdtemp()
+        key = session_key(list(range(stop)), None, None)
+        envs.SGLANG_DSV41_CSA2_SESSION_DIR.set(directory)
+        try:
+            reset_handoff()
+            request_spill(key)
+            csa2_prepare_extend([be], 0)
+            state = get_state(be)
+            for rows in state.kv_rows.values():
+                rows.fill_(0)
+            for ring in state.swa_ring.values():
+                ring.fill_(0)
+            self._extend(be, layers, 0, POLLUTE, src="junk")
+            request_load(key)
+            csa2_prepare_extend([be], stop)
+            got = self._extend(be, layers, stop, end)
+            self._check_rows(
+                {lid: ref[lid][stop:] for lid in LAYER_ORDER},
+                got,
+                "disk session suffix",
+            )
+            self._check_topk(get_state(ref_be), get_state(be), "disk session suffix")
+        finally:
+            envs.SGLANG_DSV41_CSA2_SESSION_DIR.clear()
+            reset_handoff()
+
     def test_prefix0_drops_the_stop_and_reprefill_matches(self):
         be = self._backend()
         layers = self._layers()

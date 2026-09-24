@@ -182,3 +182,81 @@ class TestCsa2Boundary(CustomTestCase):
         csa2_prepare_extend(backends, 4)
         self.assertEqual(int(target._sm70_csa2.swa_ring[0][0]), 1)
         self.assertEqual(int(draft._sm70_csa2.swa_ring[0][0]), 2)
+
+    def test_disk_session_restores_rows_after_clobber(self):
+        import tempfile
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+            request_load,
+            request_spill,
+            reset_handoff,
+            session_key,
+        )
+
+        state = _State()
+        state.kv_rows = {2: torch.arange(8, dtype=torch.uint8)}
+        state.index_rows = {2: torch.arange(4, dtype=torch.uint8)}
+        target = _Backend(state)
+        backends = [target]
+        target._sm70_csa2.swa_ring[0].fill_(4)
+        csa2_finish_forward(backends, 4, from_extend=True)
+        csa2_prepare_decode(backends)
+        key = session_key([1, 2, 3, 4], None, None)
+        directory = tempfile.mkdtemp()
+        envs.SGLANG_DSV41_CSA2_SESSION_DIR.set(directory)
+        envs.SGLANG_DSV41_CSA2_SESSION_KEEP.set(2)
+        try:
+            reset_handoff()
+            request_spill(key)
+            csa2_prepare_extend(backends, 0)
+            self.assertEqual(target._csa2_boundary.resident_end, 0)
+            target._sm70_csa2.kv_rows[2].fill_(9)
+            target._sm70_csa2.swa_ring[0].fill_(9)
+            request_load(key)
+            csa2_prepare_extend(backends, 4)
+            self.assertEqual(int(target._sm70_csa2.kv_rows[2][0]), 0)
+            self.assertEqual(int(target._sm70_csa2.kv_rows[2][3]), 3)
+            self.assertEqual(int(target._sm70_csa2.swa_ring[0][0]), 4)
+            self.assertEqual(target._csa2_boundary.resident_end, 4)
+        finally:
+            envs.SGLANG_DSV41_CSA2_SESSION_DIR.clear()
+            envs.SGLANG_DSV41_CSA2_SESSION_KEEP.clear()
+            reset_handoff()
+
+    def test_spill_files_verify_tip_under_the_pin(self):
+        import tempfile
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+            remember,
+            request_load,
+            request_spill,
+            reset_handoff,
+            session_key,
+        )
+
+        target = _Backend(_State())
+        backends = [target]
+        target._sm70_csa2.swa_ring[0].fill_(1)
+        csa2_finish_forward(backends, 4, from_extend=True)
+        csa2_prepare_decode(backends)
+        target._sm70_csa2.swa_ring[0].fill_(9)
+        csa2_finish_forward(backends, 6, from_extend=False)
+        ids = list(range(5))
+        key = session_key(ids, None, None)
+        directory = tempfile.mkdtemp()
+        envs.SGLANG_DSV41_CSA2_SESSION_DIR.set(directory)
+        try:
+            remember(key, ids, [4, 5], None, None)
+            reset_handoff()
+            request_spill(key)
+            csa2_prepare_extend(backends, 0)
+            target._sm70_csa2.swa_ring[0].fill_(3)
+            request_load(key)
+            csa2_prepare_extend(backends, 5)
+            self.assertEqual(int(target._sm70_csa2.swa_ring[0][0]), 9)
+            self.assertEqual(target._csa2_boundary.resident_end, 5)
+        finally:
+            envs.SGLANG_DSV41_CSA2_SESSION_DIR.clear()
+            reset_handoff()

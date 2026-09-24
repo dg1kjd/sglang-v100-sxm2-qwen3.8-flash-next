@@ -1725,6 +1725,11 @@ class Envs:
     # Next HTTP turn reuses KV only if new_ids starts with the last finished
     # sequence. Miss /health / flush drops the pin. Off in generic prod.
     SGLANG_DSV41_STICKY_LAST_SEQ = EnvBool(False)
+    # WO-17 phase 3: directory of N spilled CSA2 conversations. Unset keeps
+    # the one resident image only. Each rank writes its own file. LRU cap
+    # is whole conversations, oldest first.
+    SGLANG_DSV41_CSA2_SESSION_DIR = EnvStr(None)
+    SGLANG_DSV41_CSA2_SESSION_KEEP = EnvInt(4)
     # Scalar stats of DSV4.1 intermediates (RMS/NaN/MoE topk/logits). Off in prod.
     SGLANG_DEBUG_DSV41_PROBE_STATS = EnvBool(False)
     SGLANG_DEBUG_DSV41_PROBE_STATS_DIR = EnvStr("/tmp/dsv41-probe")

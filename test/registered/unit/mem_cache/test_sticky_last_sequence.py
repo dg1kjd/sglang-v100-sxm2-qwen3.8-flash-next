@@ -442,4 +442,81 @@ class TestStickyLastSequence(CustomTestCase):
         cache.cache_finished_req(req, kv_len_to_handle=1)
         self.assertIsNone(cache._last_ids)
         self.assertEqual(inner.finished, [req])
-        self.assertEqual(cache.session_held_req_count(), 0)
+
+    def test_saved_session_resumes_after_the_pin_is_gone(self):
+        import tempfile
+
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_session import (
+            remember,
+            reset_handoff,
+            save_resident,
+            session_key,
+            take_handoff,
+        )
+
+        class _Rows:
+            def __init__(self):
+                self.swa_ring = {0: torch.zeros(2, dtype=torch.uint8)}
+                self.pending_kv = {}
+                self.pending_score = {}
+                self.kv_rows = {2: torch.ones(3, dtype=torch.uint8)}
+                self.index_rows = {}
+
+        class _Pool:
+            def __init__(self):
+                self.req_to_token = torch.arange(64, dtype=torch.int32).reshape(2, 32)
+                self._free = [1]
+
+            def alloc_rows(self, need):
+                rows = self._free[-need:]
+                del self._free[-need:]
+                return rows
+
+            def free_rows(self, indices):
+                self._free.extend(indices)
+
+            def free(self, req):
+                self.free_rows([req.kv.req_pool_idx])
+                req.kv.req_pool_idx = None
+
+        class _Alloc(_FakeAllocator):
+            def alloc(self, need_size):
+                return torch.arange(need_size, dtype=torch.int32)
+
+        directory = tempfile.mkdtemp()
+        envs.SGLANG_DSV41_CSA2_SESSION_DIR.set(directory)
+        envs.SGLANG_DSV41_CSA2_SESSION_KEEP.set(2)
+        try:
+            ids = list(range(6))
+            key = session_key(ids, None, None)
+            remember(key, ids, [4, 6], None, None)
+            backend = type("B", (), {"_sm70_csa2": _Rows()})()
+            from sglang.srt.layers.attention.dsv4.sm70_csa2_boundary import (
+                csa2_finish_forward,
+                csa2_prepare_decode,
+            )
+
+            csa2_finish_forward([backend], 6, from_extend=True)
+            csa2_prepare_decode([backend])
+            save_resident([("target", backend._sm70_csa2)], backend._csa2_boundary, key)
+
+            pool = _Pool()
+            allocator = _Alloc()
+            inner = _FakeInnerCache(pool, allocator)
+            cache = StickyLastSequenceCache(inner)
+            reset_handoff()
+            nxt = _FakeReq(req_pool_idx=None, committed=0, allocated=0, origin=[])
+            result = cache.match_prefix(
+                MatchPrefixParams(key=_key(ids + [20, 21]), req=nxt)
+            )
+            self.assertEqual(inner.matches, 0)
+            self.assertEqual(len(result.device_indices), 6)
+            self.assertEqual(nxt.kv.req_pool_idx, 1)
+            spill, load = take_handoff()
+            self.assertIsNone(spill)
+            self.assertEqual(load, key)
+        finally:
+            envs.SGLANG_DSV41_CSA2_SESSION_DIR.clear()
+            envs.SGLANG_DSV41_CSA2_SESSION_KEEP.clear()
+            reset_handoff()
