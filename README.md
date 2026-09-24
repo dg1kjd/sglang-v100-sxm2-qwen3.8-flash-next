@@ -37,47 +37,37 @@ this makes them useful again for frontier-class long-context agentic work.
 
 ## Measured performance
 
-Single node, 4× V100-SXM2-32GB, TP=4, the built-in MTP draft head on,
-`--mem-fraction-static 0.86`, warm JIT. Greedy (temperature 0), thinking
-disabled, cold prefill (prefix cache flushed before each request).
+2026-09-24, `llm-decode-bench` 0.6.2, temperature 0, against
+`scripts/serve_qwen38_flash_next_nvfp4_v100.sh mtp`. 4× V100-SXM2-32GB, TP=4,
+built-in MTP (3 steps / 4 draft tokens), `--mem-fraction-static 0.86`,
+`--max-running-requests 3`. Sustained cells are 15 s of `ignore_eos` padding.
+This model's chat template leaves thinking on unless the request disables it,
+and the bench does not, so these rows are not the older thinking-off HumanEval
+numbers.
 
-**Decode.** Measured two ways, because the workloads a reader cares about are
-different:
+**Prefill**, client prompt tokens / TTFT. One scout each. The 8k row also
+matched the server counter (3,065 tok/s).
 
-| workload | decode (tok/s) | MTP accept len |
-|---|---|---|
-| Coding problems — 8× HumanEval, the 1Cat-vLLM comparison | **167.7** (median, 153–177) | 3.57 |
-| Agentic long context — 7,405-token prompt, one stream | **138** | 3.0 |
+| prompt tokens | TTFT | tok/s |
+|---|---:|---:|
+| 8,196 | 2.75 s | 2,977 |
+| 32,150 | 10.53 s | 3,054 |
+| 128,020 | 40.69 s | 3,146 |
 
-Agentic decode under concurrency — per-stream median over 8 requests at each
-concurrency (live `--max-running-requests 3`):
+**Sustained decode.** Aggregate tok/s, then per stream. Accept length is tokens
+per target forward. At one stream the engine is about 46 forwards/s; the ~2.1
+accept length is this padding workload, not a collapsed draft head.
 
-| concurrency | generation (tok/s, per stream) | time to first token |
-|---|---|---|
-| 1 | **138** | 1.95 s |
-| 2 | **80.3** | 3.03 s |
-| 3 | **64.3** | 2.96 s |
+| context | C=1 | C=2 aggregate / per stream | C=3 aggregate / per stream |
+|---|---:|---:|---:|
+| 0 | **98.9** (accept 2.11) | **120.3** / 60.1 (2.02) | **177.9** / 59.3 (2.19) |
+| 8k | **100.4** (2.18) | **118.9** / 59.5 (2.12) | **150.2** / 50.1 (2.10) |
 
-Per-stream is what a single request sees; aggregate still climbs with
-concurrency (three streams ≈ 193 tok/s combined).
+**Coding peak**, same tool, one short Python prompt, 4 runs, 256-token cap.
+Thinking stayed on and every run hit the cap. Median **119** tok/s (117–119).
 
-**Prefill** scales with prompt length — fixed per-request overhead dominates
-short prompts and amortises over long ones:
-
-| prompt tokens | 375 | 1,473 | 2,936 | 5,862 | 11,714 | 23,417 |
-|---|---|---|---|---|---|---|
-| prefill tok/s | 1,394 | 1,418 | 2,488 | 3,451 | 3,258 | 3,266 |
-
-The 7,405-token agentic prompt prefills at ~3,060 tok/s (≈2.4 s cold). The
-262K context is real: a ~131,500-token prompt prefills in ~48 s (~2,700 tok/s).
-Idle cost is ~4% CPU per rank and 0% GPU — the scheduler blocks on a poller
-rather than spinning.
-
-> For scale: on the same host, `llama.cpp` in layer-split mode took 639–663 s
-> for the same ~131.5K-token prompt. Not a like-for-like comparison — llama.cpp's
-> tensor-parallel mode was unavailable for this architecture, and layer-split
-> serialises across GPUs — but it is the practical alternative on this hardware,
-> and it is roughly an order of magnitude slower.
+Concurrency 4 is not in the table: the server's `--max-running-requests 3`
+drops it. Aggregate still climbs through C=3.
 
 ## Hardware and software requirements
 
@@ -235,21 +225,28 @@ export MODEL_PATH=~/models/DeepSeek-V4.1-Flash
 | quantisation | native mixed: MXFP8 dense (e4m3 + UE8M0, 32×32) + MXFP4 routed experts |
 | do not use | https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash , https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731 , https://huggingface.co/nvidia/DeepSeek-V4-Flash-nvfp4-DSpark (V4-Flash NVFP4, not V4.1) |
 
-Measured on that 8-card recipe (DSpark on, sticky last-seq, advertised 256k
-context, `np=1`). Coding and short-prompt checks at temperature 0; 8k prefill
-with `max_new_tokens=1`:
+Measured 2026-09-24 with `llm-decode-bench` 0.6.2 on that 8-card recipe
+(DSpark on, sticky last-seq, radix cache off, advertised 256k, `np=1`).
+Temperature 0. The server was not started with `--enable-metrics`, so this
+run has no speculative-accept gauge. Do not raise concurrency: the ship
+script pins `--max-running-requests 1`.
 
-| workload | result |
+| check | result |
 |---|---|
-| `17*19` / `is_palindrome` | correct |
-| coding-1 (`merge_sorted`, 101 tok) | **8.14 tok/s** |
-| 8k prefill | **7.98 s / 1026 tok/s** |
+| Coding peak, `merge_sorted`, natural stop at 104 tokens, 3 runs | **9.3** tok/s median (8.8–9.3) |
+| Sustained padding decode, 20 s, `ignore_eos` | **2.8** tok/s (ITL 322 ms) |
+| Prefill scout aimed at 8k | server counted 5,286 prompt tokens, TTFT **45.3 s**, **117** tok/s |
 
-Open-ended chat at temperature 1 is closer to **3 tok/s** (DSpark accept ~2).
-Temperature 0 is right for code and wrong for long prose: greedy can lock onto
-a short cycle and the target will keep signing it. Use `temperature=1`,
-`top_p=0.95` for chat. The ship script leaves `/health` as a liveness probe
-(no generation), so a load balancer GET does not drop the sticky pin.
+The 2.8 tok/s cell is greedy padding, the case this model loops on. It is not
+the coding rate. A later one-token prefill of 8,004 tokens, after that scout
+had already touched the expert spill, took 14.3 s (**558** tok/s). Treat 117
+tok/s as the cold scout in the bench run and 558 tok/s as a warmer follow-up,
+not as two competing headlines.
+
+Temperature 0 is right for short code and wrong for long prose. Use
+`temperature=1`, `top_p=0.95` for chat. The ship script leaves `/health` as a
+liveness probe (no generation), so a load balancer GET does not drop the
+sticky pin.
 
 ### Reference recipe
 
