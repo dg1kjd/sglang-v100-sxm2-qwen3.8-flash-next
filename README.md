@@ -16,7 +16,7 @@ A Volta (sm70) port of [SGLang](https://github.com/sgl-project/sglang). Those tw
 
 ## What this is
 
-Upstream SGLang does not support Volta. CUDA 13 dropped sm70, FlashAttention needs sm80+, and Volta has no bfloat16. This fork serves frontier-class long-context models on V100s anyway.
+Upstream SGLang does not support Volta. CUDA 13 dropped sm70, FlashAttention needs sm80+, and Volta has no bfloat16. This fork serves frontier-class long-context models on V100s anyway, including agentic coding through the native Anthropic Messages API (Claude Code connects directly).
 
 **Qwen3.8-Flash-Next** is the soaked model: 125B MoE, a 51 GB host-offloaded PLE n-gram table, hybrid 36×GDN + 12×QSA attention, a built-in MTP draft head, and a vision tower. It runs at the model's native 262,144-token context on four 32 GB V100s, NVFP4 weights, FP16 KV. On the MTP recipe below, prefill holds about **3,000 tok/s** from 8k through 128k. One stream decodes at about **100 tok/s** (~46 target forwards/s, accept length ~2.1 on this padding workload). Three streams reach about **180 tok/s** aggregate. Full table: [Qwen](#qwen38-flash-next).
 
@@ -126,6 +126,86 @@ Image input works on both APIs. This model emits reasoning: an empty `content` a
 | coding peak, 256-token cap | **119** median (117–119) | | |
 
 Concurrency 4 is absent because `--max-running-requests 3` drops it. Aggregate still climbs through C=3.
+
+### Reference recipe
+
+The wrapper is the supported entry. `mtp` is the recipe the numbers above were measured on.
+
+```bash
+export FLASH_NEXT_MODEL=~/models/Qwen3.8-Flash-Next-NVFP4
+bash scripts/serve_qwen38_flash_next_nvfp4_v100.sh mtp
+```
+
+Expanded (what that script runs for `mtp`). The env block is not implied by the CLI flags. `SGLANG_NUMA_BIND_V2=0` keeps the host cache interleaved; the file tier must sit on a real disk, not a tmpfs `/tmp`.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export NCCL_P2P_LEVEL=NVL
+export SGLANG_CUSTOM_ALLREDUCE_ALGO=1stage
+export SGLANG_MAMBA_CONV_DTYPE=float16
+export SGLANG_MAMBA_SSM_DTYPE=float16
+export SGLANG_SM70_FORCE_FP16=1
+export SGLANG_SM70_DENSE_GEMV=1
+export SGLANG_SM70_QWEN_FUSIONS=1
+export SGLANG_NUMA_BIND_V2=0
+export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
+export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=$HOME/hicache_storage
+
+python -m sglang.launch_server \
+  --model-path "${FLASH_NEXT_MODEL}" \
+  --served-model-name qwen38next-nvfp4 \
+  --trust-remote-code \
+  --dtype float16 \
+  --quantization modelopt_fp4 \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --attention-backend tilelang_fa_v100 \
+  --linear-attn-prefill-backend tilelang \
+  --linear-attn-decode-backend triton \
+  --kv-cache-dtype auto \
+  --tensor-parallel-size 4 \
+  --context-length 262144 \
+  --mem-fraction-static 0.86 \
+  --max-running-requests 3 \
+  --max-mamba-cache-size 20 \
+  --chunked-prefill-size 4096 \
+  --max-prefill-tokens 4096 \
+  --enable-hierarchical-cache \
+  --hicache-size 8 \
+  --hicache-mem-layout page_first \
+  --hicache-storage-backend file \
+  --hicache-write-policy write_back \
+  --sleep-on-idle \
+  --cuda-graph-max-bs-decode 3 \
+  --cuda-graph-bs-decode 1 2 3 \
+  --mamba-radix-cache-strategy extra_buffer \
+  --mamba-full-memory-ratio 0.2 \
+  --enable-cache-report \
+  --enable-metrics \
+  --ple-offload-embedding \
+  --speculative-algorithm EAGLE \
+  --speculative-draft-model-path "${FLASH_NEXT_MODEL}" \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --host 0.0.0.0 \
+  --port 11435
+```
+
+| knob | ship value | why |
+|---|---|---|
+| MTP | on, 3 steps / 4 draft tokens | The measured recipe. `target` is the same server with no draft head |
+| `--kv-cache-dtype` | `auto` (FP16 on V100) | The fast sm70 decode kernel reads only the selected top-k, so FP16 costs no decode speed and accepts better than `fp8_e5m2`. The 1-byte cache is `FLASH_NEXT_EXTRA_ARGS='--kv-cache-dtype fp8_e5m2'` plus a lower mem-fraction |
+| `--mem-fraction-static` | 0.86 | 0.88 OOMed prefill under a beyond-spec 32k / np 8 load. 0.86 costs about 12% of the KV pool and still holds long agent contexts at 3 streams |
+| `--max-running-requests` | 3 | Aggregate decode peaks here. A fourth stream adds no throughput and stretches TTFT. CUDA graphs are captured for batch 1–3 only |
+| prefill chunk | 4096 | An 8k GDN chunk OOMed in the headroom left after the KV pool. Long prompts still run, in 4k chunks |
+| `--hicache-size` | 8 per rank | Host KV and host Mamba, so total is `N × 2 × 4` ranks = 64 GB. N=16 left the box near thrashing. `page_first` is required for the Mamba host pool |
+| write policy | `write_back` | `write_through` saturated the disk and made prefix readback collapse. Disk writes happen on eviction and shutdown |
+| `--ple-offload-embedding` | on | The 51 GB n-gram table stays in host RAM. On GPU it OOMs at load |
+| `--sleep-on-idle` | on | Without it each rank busy-spins a core while idle |
+| `--enable-cache-report` | on | Surfaces prefix-cache hits to Claude Code. The cache already hits without the flag; the flag only reports them |
+
+`target` drops the four `--speculative-*` lines. Leave `SGLANG_CUSTOM_AR_ALLOW_PCIE` unset on an NVLink mesh.
 
 ## DeepSeek-V4.1-Flash
 
