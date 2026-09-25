@@ -225,7 +225,7 @@ hf download deepseek-ai/DeepSeek-V4.1-Flash \
 export MODEL_PATH=~/models/DeepSeek-V4.1-Flash
 ```
 
-~476 GB (48 shards). The export is multimodal; this recipe serves it with `--language-model-only`. The model is MIT-licensed.
+~476 GB (48 shards). The export is multimodal. The vision tower is one fp32 copy on rank 0; each GEMM streams through that GPU as fp16 and is dropped. The model is MIT-licensed.
 
 | | |
 |---|---|
@@ -288,7 +288,6 @@ python -m sglang.launch_server \
   --disable-prefill-cuda-graph \
   --cuda-graph-max-bs-decode 1 \
   --disable-radix-cache \
-  --language-model-only \
   --reasoning-parser deepseek-v41 \
   --tool-call-parser deepseekv41 \
   --trust-remote-code \
@@ -328,7 +327,7 @@ None of this exists upstream. The Volta port itself — sm70 kernels, Qwen3.8 mo
 ## Limitations and known gaps
 
 - **Qwen3.8-Flash-Next is the soaked model.** DeepSeek-V4.1-Flash on this snapshot has run a multi-hour Claude Code session on one conversation (prefix reuse at recorded stops, no crash in that session). It is still one conversation: a second session prefills from zero, and the image does not survive a restart. A long uncached suffix is about 60 tok/s. Leftover HBM after load is a few GiB, and open-ended greedy (temperature 0) can loop. Other architectures may load; several upstream model paths still assume sm80+ kernels.
-- **`multimodal_gen` (diffusion / video generation) is not ported.** It carries upstream's code, not this fork's Volta adaptations. The Qwen3.8 vision tower is a different subsystem, and it works. The DeepSeek recipe serves `--language-model-only`.
+- **`multimodal_gen` (diffusion / video generation) is not ported.** It carries upstream's code, not this fork's Volta adaptations. The Qwen3.8 vision tower is a different subsystem, and it works. DeepSeek-V4.1 image requests stream the rank-0 tower through GPU GEMMs.
 - **Stability was hammered, not soaked.** A ~1-hour sustained load — agentic prompts at np 1/2/4 plus a beyond-spec 32k-token / np 8 phase — ran with no crash and no incorrect output at the current `--mem-fraction-static 0.86`. It did surface one prefill OOM at the previous 0.88 default under the beyond-spec load; the 0.86 retune fixed it (rationale in the serve-script comment). A multi-day soak has not been run.
 - **Greedy output is not bit-reproducible across cache states.** A property of the FP16 mamba-hybrid pipeline with a radix cache: the cache replays an approximate GDN (linear-attention) state for a cached prefix, so a prompt's exact tokens can differ a little between a cold and a warm prefix, and prompts sitting on a token decision boundary can vary across runs. Every output is a valid completion.
 - **A cold FlashInfer JIT cache costs several minutes** on first launch, and four TP ranks will compile in parallel. Subsequent launches are fast.

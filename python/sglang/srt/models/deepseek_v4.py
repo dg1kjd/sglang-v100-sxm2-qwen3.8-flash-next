@@ -270,14 +270,83 @@ _DSV41_SKIP_WEIGHT_EXACT = frozenset(
 )
 
 
-def _skip_dsv41_language_only_weight(name: str) -> bool:
-    if name in _DSV41_SKIP_WEIGHT_EXACT:
-        return True
-    if name.startswith(_DSV41_SKIP_WEIGHT_PREFIXES):
+def _host_mem_available_gib() -> float:
+    try:
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except OSError:
+        return float("nan")
+    return float("nan")
+
+
+def _dsv41_cpu_tower_on(config) -> bool:
+    return int(getattr(config, "vision_n_layers", 0) or 0) > 0 and not bool(
+        getattr(config, "language_model_only", False)
+    )
+
+
+# schedule_batch.MM_PAD_SHIFT_VALUE. pad_input_ids rewrites image_token_id to a
+# per-image hash at or above this before the forward.
+_DSV41_MM_PAD_SHIFT = 1_000_000
+
+
+def _dsv41_image_position_mask(
+    input_ids: torch.Tensor, image_token_id: int
+) -> torch.Tensor:
+    """Rows that must keep the pre-Engram hidden state.
+
+    The vision scatter finds image rows after they have been rewritten to hash
+    pad ids. Matching only image_token_id lets Engram add a text n-gram on top
+    of the image embedding, so the model never sees the picture.
+    """
+    return (input_ids == image_token_id) | (input_ids >= _DSV41_MM_PAD_SHIFT)
+
+
+def _is_dsv41_tower_weight(name: str) -> bool:
+    return name in _DSV41_SKIP_WEIGHT_EXACT or name.startswith(
+        _DSV41_SKIP_WEIGHT_PREFIXES
+    )
+
+
+def _skip_dsv41_language_only_weight(
+    name: str, *, language_model_only: bool = True
+) -> bool:
+    if not language_model_only:
+        return False
+    if _is_dsv41_tower_weight(name):
         return True
     return name.endswith(".gate.bias_vl") or name.endswith(
         ".e_score_correction_bias_vl"
     )
+
+
+def resolve_dsv41_weight_name(
+    name: str,
+    *,
+    tower_on: bool,
+    is_nextn: bool = False,
+    num_hidden_layers: Optional[int] = None,
+) -> Optional[str]:
+    """Checkpoint name to parameter name. None means this load skips it.
+
+    Tower names stay as stored (`wqkv`, `wo`, `w1`). `.gate.bias_vl` becomes
+    `.gate.e_score_correction_bias_vl` only when the CPU tower is on. The
+    language-only path keeps today's skip, including `bias_vl`.
+    """
+    if _is_dsv41_tower_weight(name):
+        return name if tower_on else None
+    mapped = DeepseekV4ForCausalLM.remap_weight_name_to_dpsk_hf_format(
+        name, is_nextn=is_nextn, num_hidden_layers=num_hidden_layers
+    )
+    if mapped.endswith(".gate.bias_vl"):
+        if not tower_on:
+            return None
+        return mapped[: -len(".gate.bias_vl")] + ".gate.e_score_correction_bias_vl"
+    if _skip_dsv41_language_only_weight(mapped, language_model_only=not tower_on):
+        return None
+    return mapped
 
 
 def _is_fused_mhc_post_pre_enabled_xpu() -> bool:
@@ -2587,6 +2656,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_stream=moe_alt_stream,
             is_nextn=is_nextn,
             is_deepseek_v4=True,
+            vl_correction_bias=_dsv41_cpu_tower_on(config) and not is_nextn,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -4503,7 +4573,9 @@ class DeepseekV4Model(nn.Module):
                     and getattr(self.config, "vision_n_layers", 0) > 0
                 ):
                     hidden_states = torch.where(
-                        (input_ids == self.config.image_token_id)[:, None, None],
+                        _dsv41_image_position_mask(
+                            input_ids, self.config.image_token_id
+                        )[:, None, None],
                         before_engram,
                         hidden_states,
                     )
@@ -4739,6 +4811,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.pp_group = get_pp_group()
+        self._cpu_vision_on = _dsv41_cpu_tower_on(config)
+        self._cpu_vision_owner = (
+            self._cpu_vision_on
+            and self.pp_group.is_first_rank
+            and get_tp_group().rank_in_group == 0
+        )
+        if self._cpu_vision_owner:
+            self._install_cpu_vision(config)
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
@@ -4853,6 +4933,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             from sglang.srt.debug.dsv41_probe_stats import maybe_record_weights
 
             maybe_record_weights(self)
+        if (
+            input_embeds is None
+            and self._cpu_vision_on
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.contains_image_inputs()
+        ):
+            # Clone happens inside. Engram still sees the real image_token_id.
+            input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
@@ -4999,6 +5087,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
     ) -> str:
+        # Vision, aligner, and the three image vectors keep checkpoint names.
+        # The language substitutions below would turn `wqkv` / `w1` into
+        # attention and MLP names the CPU tower does not have.
+        if _is_dsv41_tower_weight(name):
+            return name
         if name.startswith("embed."):
             return "model.embed_tokens." + name.removeprefix("embed.")
         if name.startswith("head."):
@@ -5232,12 +5325,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 try:
                     use_async_loading = should_async_load(loaded_weight)
 
-                    name = self.remap_weight_name_to_dpsk_hf_format(
+                    name = resolve_dsv41_weight_name(
                         name,
+                        tower_on=self._cpu_vision_on,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
-                    if _skip_dsv41_language_only_weight(name):
+                    if name is None:
+                        continue
+                    if (
+                        self._cpu_vision_on
+                        and not self._cpu_vision_owner
+                        and _is_dsv41_tower_weight(name)
+                    ):
                         continue
 
                     layer_id = get_layer_id(name)
@@ -5603,39 +5703,132 @@ class DeepseekV4ForCausalLM(nn.Module):
         return len(seen)
 
     def pad_input_ids(self, input_ids, mm_inputs):
+        from sglang.srt.managers.mm_utils import (
+            MultiModalityDataPaddingPatternMultimodalTokens,
+        )
+
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
         )
 
+    def _install_cpu_vision(self, config) -> None:
+        from sglang.srt.models.deepseek_v41_vit import CpuAligner, CpuViT
+
+        hidden = config.hidden_size
+        self.vision = CpuViT(config)
+        self.aligner = CpuAligner(config)
+        self.image_start = nn.Parameter(
+            torch.zeros(hidden, dtype=torch.float32, device="cpu"),
+            requires_grad=False,
+        )
+        self.image_newline = nn.Parameter(
+            torch.zeros(hidden, dtype=torch.float32, device="cpu"),
+            requires_grad=False,
+        )
+        self.image_end = nn.Parameter(
+            torch.zeros(hidden, dtype=torch.float32, device="cpu"),
+            requires_grad=False,
+        )
+        logger.info(
+            "DSV41 CPU vision: rank 0 fp32 tower, %d layers, hidden %d",
+            config.vision_n_layers,
+            hidden,
+        )
+
+    def _vision_device(self) -> torch.device:
+        weight = getattr(self.model.embed_tokens, "weight", None)
+        if isinstance(weight, torch.Tensor):
+            return weight.device
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _broadcast_vision_span(self, span: Optional[torch.Tensor]) -> torch.Tensor:
+        group = get_tp_group()
+        device = self._vision_device()
+        if group.world_size == 1:
+            return span
+        if group.rank_in_group == 0:
+            meta = torch.tensor(list(span.shape), dtype=torch.int64, device=device)
+        else:
+            meta = torch.empty(2, dtype=torch.int64, device=device)
+        group.broadcast(meta, src=0)
+        if group.rank_in_group != 0:
+            span = torch.empty(
+                int(meta[0]), int(meta[1]), dtype=torch.float16, device=device
+            )
+        group.broadcast(span, src=0)
+        return span
+
+    def _encode_cpu_vision_item(self, item) -> torch.Tensor:
+        from sglang.srt.multimodal.deepseek_v41_image_processing import (
+            GPU_PLAN_KEY,
+            image_token_types,
+            materialize_image_gpu,
+        )
+
+        h, w = int(item.n_vit_h), int(item.n_vit_w)
+        pixels = torch.as_tensor(item.feature)
+        plan = item.model_specific_data.get(GPU_PLAN_KEY)
+        patches = materialize_image_gpu(pixels, plan) if plan is not None else pixels
+        device = self._vision_device()
+        r = self.config.vision_downsample_ratio
+        types = image_token_types((h + r - 1) // r, (w + r - 1) // r)
+        if device.type == "cuda":
+            # fp16 GEMMs on rank 0. Each weight is copied for that op and dropped.
+            features = self.aligner.streaming_gpu(
+                self.vision.streaming_gpu(patches, h, w, device), h, w
+            )
+            span = torch.empty(
+                (types.shape[0], self.config.hidden_size),
+                device=device,
+                dtype=torch.float16,
+            )
+            types = types.to(device)
+            span[types == 0] = self.image_start.detach().to(device=device, dtype=span.dtype)
+            span[types == 1] = features
+            span[types == 2] = self.image_newline.detach().to(device=device, dtype=span.dtype)
+            span[types == 3] = self.image_end.detach().to(device=device, dtype=span.dtype)
+            torch.cuda.empty_cache()
+            return span
+        features = self.aligner(self.vision(patches.cpu(), h, w), h, w)
+        span = torch.empty(
+            (len(types), self.config.hidden_size), dtype=torch.float32
+        )
+        span[types == 0] = self.image_start.detach().to(device=span.device)
+        span[types == 1] = features.to(device=span.device)
+        span[types == 2] = self.image_newline.detach().to(device=span.device)
+        span[types == 3] = self.image_end.detach().to(device=span.device)
+        return span
+
     def get_image_feature(self, items):
-        """Return complete spans for the shared MM cache and chunk scheduler."""
+        """Rank 0 runs the CPU tower. Every rank receives the fp16 span."""
 
         spans = []
-        device, dtype = self.image_start.device, self.image_start.dtype
-        for item in items:
-            item.reconstruct(device.index, ipc_consumer_count=self.tp_size)
-            h, w = int(item.n_vit_h), int(item.n_vit_w)
-            pixels = torch.as_tensor(item.feature, device=device)
-            plan = item.model_specific_data.get(GPU_PLAN_KEY)
-            patches = (
-                materialize_image_gpu(pixels, plan).to(dtype)
-                if plan is not None
-                else pixels.to(dtype)
+        if self._cpu_vision_owner:
+            avail = _host_mem_available_gib()
+            tic = time.perf_counter()
+            device_index = self._vision_device().index
+            if device_index is None:
+                device_index = 0
+            for item in items:
+                item.reconstruct(device_index, ipc_consumer_count=self.tp_size)
+                spans.append(self._encode_cpu_vision_item(item))
+            logger.info(
+                "DSV41 vision forward: %.2fs images=%d host_available=%.2fGiB device=%s",
+                time.perf_counter() - tic,
+                len(items),
+                avail,
+                self._vision_device().type,
             )
-            features = self.aligner(self.vision(patches, h, w), h, w)
-            r = self.config.vision_downsample_ratio
-            types = image_token_types((h + r - 1) // r, (w + r - 1) // r).to(device)
-            span = torch.empty(
-                (len(types), self.config.hidden_size), device=device, dtype=dtype
-            )
-            span[types == 0] = self.image_start
-            span[types == 1] = features.to(dtype)
-            span[types == 2] = self.image_newline
-            span[types == 3] = self.image_end
-            spans.append(span)
+        else:
+            spans = [None] * len(items)
+        if get_tp_group().world_size > 1:
+            spans = [self._broadcast_vision_span(span) for span in spans]
         return spans
 
     def _prepare_mm_embeddings(self, input_ids, forward_batch):
+        from sglang.srt.managers.mm_utils import embed_mm_inputs
+        from sglang.srt.managers.schedule_batch import MultimodalInputs
+
         # Keep scheduler hash IDs intact: the shared embedder clamps its input in place.
         input_embeds, _ = embed_mm_inputs(
             mm_inputs_list=[

@@ -182,7 +182,6 @@ exec "${NSYS_WRAP[@]}" python -m sglang.launch_server \
   --pre-warm-nccl \
   --warmups dsv41_chunk \
   "${GRAPH_FLAGS[@]}" \
-  --language-model-only \
   --reasoning-parser deepseek-v41 \
   --tool-call-parser deepseekv41 \
   --trust-remote-code \

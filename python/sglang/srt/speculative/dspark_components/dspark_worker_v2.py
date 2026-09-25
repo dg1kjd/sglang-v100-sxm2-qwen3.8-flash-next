@@ -89,6 +89,36 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+
+def _extend_span_has_image_token(worker, batch) -> bool:
+    """Image prefills stay on the target. The draft would embed image_token_id."""
+    model_config = getattr(worker.target_worker, "model_runner", None)
+    hf = getattr(getattr(model_config, "model_config", None), "hf_config", None)
+    if hf is None:
+        return False
+    token_id = getattr(hf, "image_token_id", None)
+    if token_id is None:
+        return False
+    if int(getattr(hf, "vision_n_layers", 0) or 0) <= 0:
+        return False
+    if getattr(hf, "language_model_only", False):
+        return False
+    # ScheduleBatch stores this as multimodal_inputs. input_ids is None on
+    # extend; the token ids sit on prefill_input_ids_cpu until H2D.
+    mm_inputs = getattr(batch, "multimodal_inputs", None) or []
+    for mm in mm_inputs:
+        if mm is not None and mm.contains_image_inputs():
+            return True
+    for name in ("input_ids", "prefill_input_ids_cpu"):
+        ids = getattr(batch, name, None)
+        if (
+            isinstance(ids, torch.Tensor)
+            and ids.numel()
+            and bool((ids == token_id).any().item())
+        ):
+            return True
+    return False
+
 _is_npu = is_npu()
 
 
@@ -589,6 +619,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
+            if _extend_span_has_image_token(self, batch):
+                logger.info("DSV41 image extend: target only, DSpark skipped")
+                batch_output = self.target_worker.forward_batch_generation(
+                    batch, pp_proxy_tensors=pp_proxy_tensors
+                )
+                batch_output.new_seq_lens = batch.seq_lens
+                if on_publish is not None:
+                    on_publish(batch_output.new_seq_lens)
+                batch_output.next_draft_input = make_next_draft_input(
+                    bonus_tokens=batch_output.next_token_ids,
+                    new_seq_lens=batch.seq_lens,
+                )
+                return batch_output
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
