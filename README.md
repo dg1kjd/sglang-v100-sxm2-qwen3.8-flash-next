@@ -20,7 +20,7 @@ Upstream SGLang does not support Volta. CUDA 13 dropped sm70, FlashAttention nee
 
 **Qwen3.8-Flash-Next** is the soaked model: 125B MoE, a 51 GB host-offloaded PLE n-gram table, hybrid 36×GDN + 12×QSA attention, a built-in MTP draft head, and a vision tower. It runs at the model's native 262,144-token context on four 32 GB V100s, NVFP4 weights, FP16 KV. On the MTP recipe below, prefill holds about **3,000 tok/s** from 8k through 128k. One stream decodes at about **100 tok/s** (~46 target forwards/s, accept length ~2.1 on this padding workload). Three streams reach about **180 tok/s** aggregate. Full table: [Qwen](#qwen38-flash-next).
 
-**DeepSeek-V4.1-Flash** ([checkpoint](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)) is the second engine, and the one this tree serves on Volta: CSA2 sparse attention, host Engram, MXFP4 expert spill, and the checkpoint's own DSpark draft, on eight 32 GB V100s. One resident agent session continues from a recorded prefix stop. A second session still prefills from scratch. Short code is about **9 tok/s**; warm 8k prefill is about **560 tok/s**. Full table: [DeepSeek-V4.1-Flash](#deepseek-v41-flash).
+**DeepSeek-V4.1-Flash** ([checkpoint](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)) is the second engine, and the one this tree serves on Volta: CSA2 sparse attention, host Engram, MXFP4 expert spill, and the checkpoint's own DSpark draft, on eight 32 GB V100s. One resident agent session continues from a recorded prefix stop. A second session still prefills from scratch. Short code is about **9 tok/s**; warm 8k prefill is about **560 tok/s**. Vision support for casual image inference (semi-performant). Full table: [DeepSeek-V4.1-Flash](#deepseek-v41-flash).
 
 ## Hardware and software requirements
 
